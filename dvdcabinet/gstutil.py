@@ -12,7 +12,7 @@ import gi
 
 gi.require_version("Gst", "1.0")
 gi.require_version("GstVideo", "1.0")
-from gi.repository import GLib, Gst, GstVideo  # noqa: E402
+from gi.repository import GLib, GObject, Gst, GstVideo  # noqa: E402
 
 log = logging.getLogger(__name__)
 
@@ -67,6 +67,34 @@ def init() -> None:
     _main_loop = GLib.MainLoop()
     threading.Thread(target=_main_loop.run, name="glib-main", daemon=True).start()
     log.info("GStreamer %s ready", Gst.version_string())
+
+
+class Handlers:
+    """The signal handlers and pad probes of one pipeline, so they can all be dropped on close.
+
+    A Python callback connected to a GStreamer object keeps its owner alive, and the
+    object keeps the callback: a reference cycle Python's garbage collector can't see
+    through. Unless the handlers are removed, closed pipelines are never freed (and
+    webrtcbin keeps its threads running).
+    """
+
+    def __init__(self) -> None:
+        self._signals: list[tuple[GObject.Object, int]] = []
+        self._probes: list[tuple[Gst.Pad, int]] = []
+
+    def connect(self, obj: GObject.Object, signal: str, callback, *args) -> None:
+        self._signals.append((obj, obj.connect(signal, callback, *args)))
+
+    def probe(self, pad: Gst.Pad, mask: Gst.PadProbeType, callback) -> None:
+        self._probes.append((pad, pad.add_probe(mask, callback)))
+
+    def release(self) -> None:
+        for obj, handler in self._signals:
+            obj.disconnect(handler)
+        for pad, probe in self._probes:
+            pad.remove_probe(probe)
+        self._signals.clear()
+        self._probes.clear()
 
 
 def dvd_format(nick: str) -> Gst.Format | None:

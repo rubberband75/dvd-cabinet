@@ -8,4 +8,7 @@ if [ ! -x .venv/bin/python ]; then
   python3 -m venv --system-site-packages .venv
   .venv/bin/pip install --quiet -r requirements.txt
 fi
+# Every playback session starts dozens of short-lived GStreamer threads; by default glibc
+# gives each its own memory arena and never returns them, so memory creeps up per session.
+export MALLOC_ARENA_MAX="${MALLOC_ARENA_MAX:-2}"
 exec .venv/bin/python -m dvdcabinet "$@"

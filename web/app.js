@@ -3,9 +3,9 @@
 /* DVD Cabinet web client.
  *
  * Library: a grid of discs from /api/discs (thumbnails are menu screenshots taken by the server).
- * Player:  one WebSocket per viewing. The server runs a virtual DVD player and streams fragmented
- *          MP4 (H.264 + AAC) that we feed to Media Source Extensions; remote-control presses,
- *          mouse moves and clicks go back up the same socket as JSON.
+ * Player:  one WebSocket per viewing. The server runs a virtual DVD player and streams it to us
+ *          over WebRTC (falling back to fragmented MP4 over the socket, played with Media Source
+ *          Extensions); remote-control presses, mouse moves and clicks go back up the socket as JSON.
  */
 
 const $ = (id) => document.getElementById(id);
@@ -140,29 +140,50 @@ const Library = {
   },
 };
 
-/* ---- Stream client (Media Source Extensions) ---------------------------- */
+/* ---- Streaming ---------------------------------------------------------- */
 
-class StreamClient {
-  constructor(video, url, onEvent) {
+// One WebSocket per viewing. It carries control messages both ways, plus either the
+// WebRTC signaling (the media then flows peer-to-peer over UDP) or, as a fallback,
+// the media itself as fragmented MP4 for Media Source Extensions.
+class Connection {
+  constructor(video, discId, transport, onEvent) {
     this.video = video;
     this.onEvent = onEvent;
-    this.queue = [];
-    this.ms = null;
-    this.sb = null;
+    this.wanted = transport; // 'auto' | 'webrtc' | 'mse'
+    this.transport = null;
+    this.media = null;
     this.closed = false;
     this.blocked = false;
     this.playPending = false;
     this.started = false;
-    this.ws = new WebSocket(url);
+    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+    this.ws = new WebSocket(`${proto}://${location.host}/api/discs/${discId}/play`);
     this.ws.binaryType = 'arraybuffer';
     this.ws.onmessage = (e) => this.message(e);
     this.ws.onclose = () => { if (!this.closed) this.onEvent({ type: 'disconnected' }); };
-    this.ticker = setInterval(() => this.tick(), 250);
     this.onVideoError = () => {
       const err = this.video.error;
       if (err) this.onEvent({ type: 'error', message: `The browser couldn't decode the video (${err.message || `code ${err.code}`}).` });
     };
     this.video.addEventListener('error', this.onVideoError);
+  }
+
+  message(e) {
+    if (this.closed) return; // messages already queued when we were closed
+    if (typeof e.data !== 'string') {
+      this.media?.binary(e.data);
+      return;
+    }
+    const msg = JSON.parse(e.data);
+    if (msg.type === 'hello') this.begin(msg);
+    if (!this.media?.handle(msg)) this.onEvent(msg);
+  }
+
+  begin(hello) {
+    const rtc = this.wanted !== 'mse' && 'RTCPeerConnection' in window && (hello.transports || []).includes('webrtc');
+    this.transport = rtc ? 'webrtc' : 'mse';
+    this.media = rtc ? new RtcMedia(this) : new MseMedia(this);
+    this.send({ type: 'start', transport: this.transport, ...this.media.startParams() });
   }
 
   send(msg) {
@@ -171,25 +192,134 @@ class StreamClient {
 
   close() {
     this.closed = true;
-    clearInterval(this.ticker);
     this.video.removeEventListener('error', this.onVideoError);
     try { this.ws.close(); } catch { /* already closed */ }
     this.video.pause();
+    this.media?.close();
+    this.video.srcObject = null;
     this.video.removeAttribute('src');
     this.video.load();
-    if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
   }
 
-  message(e) {
-    if (this.closed) return; // messages already queued when we were closed
-    if (typeof e.data === 'string') {
-      const msg = JSON.parse(e.data);
-      if (msg.type === 'stream') this.setup(msg);
-      else this.onEvent(msg);
-      return;
+  play() {
+    if (this.playPending || this.blocked) return;
+    this.playPending = true;
+    this.video.play().then(() => {
+      if (!this.started) { this.started = true; this.onEvent({ type: 'playing' }); }
+    }).catch((err) => {
+      if (err.name === 'NotAllowedError') { this.blocked = true; this.onEvent({ type: 'autoplay-blocked' }); }
+    }).finally(() => { this.playPending = false; });
+  }
+
+  unblock() {
+    this.blocked = false;
+    this.play();
+  }
+}
+
+// WebRTC: the server makes the offer; we answer and trade ICE candidates over the socket.
+class RtcMedia {
+  constructor(conn) {
+    this.conn = conn;
+    this.video = conn.video;
+    this.stream = new MediaStream();
+    this.pendingIce = [];
+    this.failed = false;
+    this.pc = new RTCPeerConnection({ bundlePolicy: 'max-bundle' });
+    this.pc.ontrack = (e) => {
+      this.stream.addTrack(e.track);
+      // Play frames as soon as they arrive; this is an interactive stream, not a movie file.
+      try { e.receiver.jitterBufferTarget = 0; } catch { /* not supported */ }
+      if (this.video.srcObject !== this.stream) this.video.srcObject = this.stream;
+      conn.play();
+    };
+    this.pc.onicecandidate = (e) => {
+      if (e.candidate) conn.send({ type: 'ice', candidate: e.candidate.candidate, sdpMLineIndex: e.candidate.sdpMLineIndex });
+    };
+    this.pc.onconnectionstatechange = () => { if (this.pc.connectionState === 'failed') this.fail(); };
+    // Blocked UDP never "fails" quickly on its own, so give up after a while and fall back.
+    this.timer = setTimeout(() => { if (this.pc.connectionState !== 'connected') this.fail(); }, 8000);
+  }
+
+  startParams() {
+    const caps = window.RTCRtpReceiver?.getCapabilities?.('video');
+    const codecs = caps ? [...new Set(caps.codecs.map((c) => c.mimeType.split('/')[1].toUpperCase()))] : [];
+    return { video_codecs: codecs };
+  }
+
+  handle(msg) {
+    if (msg.type === 'offer') {
+      this.answer(msg.sdp);
+      return true;
     }
+    if (msg.type === 'ice') {
+      const candidate = { candidate: msg.candidate, sdpMLineIndex: msg.sdpMLineIndex };
+      if (this.pendingIce) this.pendingIce.push(candidate); // remote description not set yet
+      else this.pc.addIceCandidate(candidate).catch(() => {});
+      return true;
+    }
+    return false;
+  }
+
+  async answer(sdp) {
+    try {
+      await this.pc.setRemoteDescription({ type: 'offer', sdp });
+      for (const c of this.pendingIce) this.pc.addIceCandidate(c).catch(() => {});
+      this.pendingIce = null;
+      const answer = await this.pc.createAnswer();
+      await this.pc.setLocalDescription({ type: 'answer', sdp: stereoOpus(answer.sdp) });
+      this.conn.send({ type: 'answer', sdp: this.pc.localDescription.sdp });
+    } catch (err) {
+      console.warn('WebRTC negotiation failed:', err);
+      this.fail();
+    }
+  }
+
+  fail() {
+    if (this.failed || this.conn.closed) return;
+    this.failed = true;
+    this.conn.onEvent({ type: 'transport-failed' });
+  }
+
+  binary() {}
+
+  close() {
+    clearTimeout(this.timer);
+    this.pc.close();
+  }
+}
+
+// Browsers decode WebRTC Opus as mono unless the answer asks for stereo.
+function stereoOpus(sdp) {
+  const m = sdp.match(/a=rtpmap:(\d+) opus\/48000\/2/i);
+  if (!m) return sdp;
+  const fmtp = new RegExp(`a=fmtp:${m[1]} [^\\r\\n]*`);
+  if (!fmtp.test(sdp)) return sdp.replace(m[0], `${m[0]}\r\na=fmtp:${m[1]} stereo=1;sprop-stereo=1`);
+  return sdp.replace(fmtp, (line) => (/[ ;]stereo=/.test(line) ? line : `${line};stereo=1;sprop-stereo=1`));
+}
+
+// Fallback: fragmented MP4 over the WebSocket into Media Source Extensions.
+class MseMedia {
+  constructor(conn) {
+    this.conn = conn;
+    this.video = conn.video;
+    this.queue = [];
+    this.ms = null;
+    this.sb = null;
+    this.ticker = setInterval(() => this.tick(), 250);
+  }
+
+  startParams() { return {}; }
+
+  handle(msg) {
+    if (msg.type !== 'stream') return false;
+    this.setup(msg);
+    return true;
+  }
+
+  binary(data) {
     // 1 type byte (0x01 init segment, 0x02 media segment), then the MP4 bytes
-    this.queue.push(new Uint8Array(e.data, 1));
+    this.queue.push(new Uint8Array(data, 1));
     this.pump();
   }
 
@@ -197,7 +327,7 @@ class StreamClient {
     const MS = window.MediaSource || window.ManagedMediaSource;
     const mime = `video/mp4; codecs="${msg.codecs}"`;
     if (!MS || !MS.isTypeSupported(mime)) {
-      this.onEvent({ type: 'error', message: `This browser can't play ${mime} through Media Source Extensions.` });
+      this.conn.onEvent({ type: 'error', message: `This browser can't play ${mime} through Media Source Extensions.` });
       return;
     }
     this.ms = new MS();
@@ -205,11 +335,11 @@ class StreamClient {
     this.objectUrl = URL.createObjectURL(this.ms);
     this.video.src = this.objectUrl;
     this.ms.addEventListener('sourceopen', () => {
-      if (this.closed) return;
+      if (this.conn.closed) return;
       try {
         this.sb = this.ms.addSourceBuffer(mime);
       } catch (err) {
-        this.onEvent({ type: 'error', message: `This browser can't play the stream (${err.name}).` });
+        this.conn.onEvent({ type: 'error', message: `This browser can't play the stream (${err.name}).` });
         return;
       }
       this.sb.mode = 'segments';
@@ -231,7 +361,7 @@ class StreamClient {
     try {
       sb.appendBuffer(data);
     } catch (err) {
-      this.onEvent({ type: 'error', message: `The browser rejected the video stream (${err.name}).` });
+      this.conn.onEvent({ type: 'error', message: `The browser rejected the video stream (${err.name}).` });
     }
   }
 
@@ -252,25 +382,15 @@ class StreamClient {
     } else if (lag < 0.25) {
       v.playbackRate = 1;
     }
-    if (v.paused && !this.blocked) this.play();
+    if (v.paused) this.conn.play();
     if (!sb.updating && v.currentTime - v.buffered.start(0) > 30) {
       try { sb.remove(0, v.currentTime - 10); } catch { /* busy; next tick */ }
     }
   }
 
-  play() {
-    if (this.playPending) return;
-    this.playPending = true;
-    this.video.play().then(() => {
-      if (!this.started) { this.started = true; this.onEvent({ type: 'playing' }); }
-    }).catch((err) => {
-      if (err.name === 'NotAllowedError') { this.blocked = true; this.onEvent({ type: 'autoplay-blocked' }); }
-    }).finally(() => { this.playPending = false; });
-  }
-
-  unblock() {
-    this.blocked = false;
-    this.play();
+  close() {
+    clearInterval(this.ticker);
+    if (this.objectUrl) URL.revokeObjectURL(this.objectUrl);
   }
 }
 
@@ -279,6 +399,8 @@ class StreamClient {
 const Player = {
   client: null,
   discId: null,
+  // ?transport=mse forces the WebSocket fallback; otherwise WebRTC when possible.
+  transport: new URLSearchParams(location.search).get('transport') || 'auto',
   status: {},
   statusAt: 0,
   titles: [],
@@ -323,7 +445,10 @@ const Player = {
     });
 
     video.addEventListener('click', (e) => this.onVideoClick(e));
-    video.addEventListener('playing', () => $('ov-loading').classList.add('hidden'));
+    // Hide the spinner once a picture is actually showing (WebRTC "plays" before its first frame).
+    const shown = () => { if (!video.paused && video.videoWidth) $('ov-loading').classList.add('hidden'); };
+    video.addEventListener('playing', shown);
+    video.addEventListener('resize', shown);
     $('stage').addEventListener('pointermove', (e) => {
       this.wake();
       if (e.target === video && e.pointerType === 'mouse' && this.status.menu) {
@@ -369,8 +494,7 @@ const Player = {
     $('stage').classList.remove('over-button');
     this.renderStatus({ menu: true });
     $('np-status').textContent = 'Loading…';
-    const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-    this.client = new StreamClient($('video'), `${proto}://${location.host}/api/discs/${this.discId}/play`, (ev) => this.onEvent(ev));
+    this.client = new Connection($('video'), this.discId, this.transport, (ev) => this.onEvent(ev));
   },
 
   stop() {
@@ -391,7 +515,12 @@ const Player = {
       case 'hover': $('stage').classList.toggle('over-button', ev.active); break;
       case 'highlight': if (!ev.rect) $('stage').classList.remove('over-button'); break;
       case 'titles': this.titles = ev.titles; this.renderTitles(); break;
-      case 'playing': $('ov-loading').classList.add('hidden'); break;
+      case 'transport-failed':
+        // WebRTC couldn't connect (UDP blocked?): replay over the WebSocket for the rest of this visit.
+        console.warn('WebRTC could not connect; falling back to streaming over the WebSocket');
+        this.transport = 'mse';
+        this.start();
+        break;
       case 'autoplay-blocked': $('ov-loading').classList.add('hidden'); $('ov-start').classList.remove('hidden'); break;
       case 'ended': this.showMessage('The disc has finished', 'Thanks for watching.'); break;
       case 'error': this.showMessage('Playback problem', ev.message); break;

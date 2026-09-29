@@ -1,4 +1,7 @@
-"""Re-frame mp4mux's fragmented-MP4 byte stream into Media Source Extensions units.
+"""Fallback transport: fragmented MP4 over the WebSocket, played with Media Source Extensions.
+
+Used when WebRTC can't connect (UDP blocked, no WebRTC support). It works anywhere
+a WebSocket does, at the cost of the browser buffering a few hundred ms more.
 
 mp4mux emits headers and fragments in arbitrary small pieces (an mdat header in one
 buffer, its payload in the next, ...). Browsers want the init segment (ftyp+moov)
@@ -8,6 +11,47 @@ first, then complete media segments (moof+mdat), so we split on top-level boxes.
 from __future__ import annotations
 
 from typing import Callable
+
+from .gstutil import Gst
+from .player import OutputPipeline, StreamGeometry
+
+
+class Fmp4Output(OutputPipeline):
+    """H.264 + AAC in fragmented MP4, one fragment per frame; on_init/on_segment get the bytes."""
+
+    def __init__(
+        self,
+        geometry: StreamGeometry,
+        on_init: Callable[[bytes, str], None],
+        on_segment: Callable[[bytes], None],
+        on_error: Callable[[str], None],
+        crf: int = 20,
+    ):
+        super().__init__(
+            geometry,
+            f"""
+            x264enc name=video tune=zerolatency speed-preset=veryfast pass=qual quantizer={crf}
+                key-int-max={2 * geometry.fps_n // geometry.fps_d} !
+              video/x-h264,profile=high ! h264parse ! queue ! mux.
+            audioconvert name=audio ! avenc_aac bitrate=192000 ! aacparse ! queue ! mux.
+            mp4mux name=mux fragment-duration=1 streamable=true !
+              appsink name=sink sync=false emit-signals=true
+            """,
+            on_error,
+        )
+        self._on_init = on_init
+        self._splitter = Mp4Splitter(self._got_init, on_segment)
+        self._handlers.connect(self.pipeline.get_by_name("sink"), "new-sample", self._on_sample)
+
+    def _on_sample(self, sink: Gst.Element) -> Gst.FlowReturn:
+        sample = sink.emit("pull-sample")
+        if sample is not None:
+            buf = sample.get_buffer()
+            self._splitter.feed(buf.extract_dup(0, buf.get_size()))
+        return Gst.FlowReturn.OK
+
+    def _got_init(self, init: bytes) -> None:
+        self._on_init(init, codecs_from_init(init))
 
 
 class Mp4Splitter:

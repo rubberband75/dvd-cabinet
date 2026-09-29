@@ -1,4 +1,4 @@
-"""One DVD playback session, streamed to a browser as fragmented MP4.
+"""One DVD playback session, streamed to one browser.
 
 DVD pipeline (runs on "DVD time": stops dead on still menus, flushes on every jump)
 
@@ -10,9 +10,9 @@ DVD pipeline (runs on "DVD time": stops dead on still menus, flushes on every ju
                           silence, producing a steady, never-ending stream
                                                                            │
 Output pipeline (live)                                                     ▼
-    appsrc ─► x264enc ─► h264parse ──┐
-                                      ├─► mp4mux (fragmented) ─► appsink ─► Mp4Splitter ─► browser
-    appsrc ─► avenc_aac ─► aacparse ─┘
+    appsrc ─► video encoder ─┐
+                              ├─► WebRTC (webrtc.py), or fragmented MP4 over the WebSocket (fmp4.py)
+    appsrc ─► audio encoder ─┘
 
 Keeping the two apart means nothing the disc does (stills, flushes, resolution and
 aspect changes, 5.1 vs stereo) can ever reach the encoder or the browser's player.
@@ -28,11 +28,11 @@ from dataclasses import dataclass
 from typing import Callable
 
 from .discinfo import DiscInfo
-from .fmp4 import Mp4Splitter, codecs_from_init
 from .gstutil import (
     GLib,
     Gst,
     GstVideo,
+    Handlers,
     dvd_format,
     navigation_command,
     navigation_key,
@@ -47,6 +47,7 @@ AUDIO_RATE = 48000
 AUDIO_CHANNELS = 2
 AUDIO_BPF = 2 * AUDIO_CHANNELS  # S16LE interleaved
 AUDIO_CAPS = f"audio/x-raw,format=S16LE,rate={AUDIO_RATE},channels={AUDIO_CHANNELS},layout=interleaved"
+AUDIO_SLICE = AUDIO_RATE // 100  # the pacer sends audio in 10 ms pieces
 
 NAV_KEYS = {"up": "Up", "down": "Down", "left": "Left", "right": "Right", "enter": "Return"}
 # GObject introspection only exposes MENU1..7; navigation.h aliases them as the DVD_* commands.
@@ -120,6 +121,7 @@ class DvdPipeline:
         self._on_message = on_message
         self.dar = 4 / 3  # display aspect of the current DVD picture
 
+        self._handlers = Handlers()
         self.pipeline = Gst.Pipeline.new("dvd")
         self.dvd = make("rsndvdbin", device=device)
         self.spu = make("dvdspu")  # renders subtitles and menu button highlights
@@ -152,10 +154,10 @@ class DvdPipeline:
         self.pipeline.add(self.dvd)
 
         self.vsink = video_chain[-1]
-        self.vsink.connect("new-sample", self._pull, self._on_video)
+        self._handlers.connect(self.vsink, "new-sample", self._pull, self._on_video)
         if on_audio is not None:
-            audio_chain[-1].connect("new-sample", self._pull, self._on_audio)
-        self.dvd.connect("pad-added", self._on_pad_added)
+            self._handlers.connect(audio_chain[-1], "new-sample", self._pull, self._on_audio)
+        self._handlers.connect(self.dvd, "pad-added", self._on_pad_added)
 
         self._bus = self.pipeline.get_bus()
         self._bus.add_watch(GLib.PRIORITY_DEFAULT, self._on_bus)
@@ -175,7 +177,7 @@ class DvdPipeline:
         pad.link(queue.get_static_pad("sink"))
         if name.startswith("video"):
             queue.link_pads("src", self.spu, "video")
-            pad.add_probe(Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_video_pad_event)
+            self._handlers.probe(pad, Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_video_pad_event)
         elif name.startswith("subpicture"):
             queue.link_pads("src", self.spu, "subpicture")
         elif name.startswith("audio"):
@@ -228,6 +230,7 @@ class DvdPipeline:
     def close(self) -> None:
         self.pipeline.set_state(Gst.State.NULL)
         self._bus.remove_watch()
+        self._handlers.release()
 
 
 class MediaPacer:
@@ -237,8 +240,8 @@ class MediaPacer:
     menu delivers a couple of frames and then nothing for as long as it sits there,
     and every jump flushes. The encoder and mp4mux need uninterrupted, monotonic
     timestamps, so this thread ticks at the output frame rate, re-sending the latest
-    frame and filling audio gaps with silence. Audio and video are both delayed by
-    `delay_ms` so bursty audio arrival never underruns.
+    frame, and sends audio in small slices, filling gaps with silence. Audio and video
+    are both delayed by `delay_ms` so bursty audio arrival never underruns.
     """
 
     def __init__(self, pipeline: Gst.Pipeline, vsrc: Gst.Element, asrc: Gst.Element, geometry: StreamGeometry, delay_ms: int = 60):
@@ -304,39 +307,45 @@ class MediaPacer:
         geo = self.geometry
         frame = 0
         samples = 0
+        # Video goes out once per frame; audio in 10 ms slices on its own cadence, so it
+        # leaves as a smooth stream rather than in frame-sized bursts (WebRTC receivers
+        # size their audio jitter buffer to the burstiness they see).
         while not self._stop.is_set():
-            pts = start + geo.frame_time(frame)
+            vpts = start + geo.frame_time(frame)
+            apts = start + samples * Gst.SECOND // AUDIO_RATE
+            due = min(vpts, apts)
             now = clock.get_time() - base
-            if pts > now:
-                if self._stop.wait((pts - now) / 1e9):
+            if due > now:
+                if self._stop.wait((due - now) / 1e9):
                     break
-            elif now - pts > Gst.SECOND:  # stalled (suspend, debugger...): skip ahead
+                continue
+            if now - due > Gst.SECOND:  # stalled (suspend, debugger...): skip ahead
                 frame = (now - start) * geo.fps_n // (Gst.SECOND * geo.fps_d)
-                samples = geo.frame_time(frame) * AUDIO_RATE // Gst.SECOND
+                samples = (now - start) * AUDIO_RATE // Gst.SECOND
                 continue
 
-            # audio for exactly this frame's time slot, so both streams stay on one grid
-            n_samples = geo.frame_time(frame + 1) * AUDIO_RATE // Gst.SECOND - samples
-            cutoff = time.monotonic_ns() - self.delay_ns
-            with self._lock:
-                while self._frames and self._frames[0][0] <= cutoff:
-                    self._frame = self._frames.popleft()[1]
-                video = self._frame
-                audio = self._take_audio(n_samples)
-
-            vbuf = video.copy()  # shallow: shares the frame's memory
-            vbuf.unset_flags(Gst.BufferFlags.DISCONT | Gst.BufferFlags.GAP)
-            vbuf.pts = vbuf.dts = pts
-            vbuf.duration = geo.frame_time(frame + 1) - geo.frame_time(frame)
-            abuf = Gst.Buffer.new_wrapped(audio)
-            abuf.pts = abuf.dts = start + samples * Gst.SECOND // AUDIO_RATE
-            abuf.duration = n_samples * Gst.SECOND // AUDIO_RATE
-            if self.vsrc.emit("push-buffer", vbuf) != Gst.FlowReturn.OK:
-                break
-            if self.asrc.emit("push-buffer", abuf) != Gst.FlowReturn.OK:
-                break
-            samples += n_samples
-            frame += 1
+            if vpts <= apts:
+                cutoff = time.monotonic_ns() - self.delay_ns
+                with self._lock:
+                    while self._frames and self._frames[0][0] <= cutoff:
+                        self._frame = self._frames.popleft()[1]
+                    video = self._frame
+                buf = video.copy()  # shallow: shares the frame's memory
+                buf.unset_flags(Gst.BufferFlags.DISCONT | Gst.BufferFlags.GAP)
+                buf.pts = buf.dts = vpts
+                buf.duration = geo.frame_time(frame + 1) - geo.frame_time(frame)
+                if self.vsrc.emit("push-buffer", buf) != Gst.FlowReturn.OK:
+                    break
+                frame += 1
+            else:
+                with self._lock:
+                    audio = self._take_audio(AUDIO_SLICE)
+                buf = Gst.Buffer.new_wrapped(audio)
+                buf.pts = buf.dts = apts
+                buf.duration = AUDIO_SLICE * Gst.SECOND // AUDIO_RATE
+                if self.asrc.emit("push-buffer", buf) != Gst.FlowReturn.OK:
+                    break
+                samples += AUDIO_SLICE
 
 
 def _black_frame(geometry: StreamGeometry) -> Gst.Buffer:
@@ -353,26 +362,69 @@ def _black_frame(geometry: StreamGeometry) -> Gst.Buffer:
     return sample.get_buffer()
 
 
-class DvdSession:
-    """A virtual DVD player: plays one disc image and streams it as fMP4.
+class OutputPipeline:
+    """The encoder side of a session: appsrcs named "vsrc" and "asrc", fed by the MediaPacer.
 
-    Callbacks fire on GStreamer threads:
-      on_init(init_segment, codecs)  -- once, before any media segment
-      on_segment(moof_mdat)          -- continuously, ~every frame
-      on_event(dict)                 -- JSON-able state updates for the UI
+    Subclasses supply the rest of the pipeline (encoders and how the result reaches
+    the browser) and handle any signaling messages the browser sends for it.
+    """
+
+    def __init__(self, geometry: StreamGeometry, rest: str, on_error: Callable[[str], None]):
+        geo = geometry
+        self.pipeline = Gst.parse_launch(
+            f"""
+            appsrc name=vsrc is-live=true format=time do-timestamp=false max-bytes=0
+                caps="{geo.video_caps},framerate={geo.fps_n}/{geo.fps_d}" !
+              queue max-size-buffers=8 max-size-bytes=0 max-size-time=0 ! video.
+            appsrc name=asrc is-live=true format=time do-timestamp=false max-bytes=0 caps="{AUDIO_CAPS}" !
+              queue ! audio.
+            {rest}
+            """
+        )
+        self.vsrc = self.pipeline.get_by_name("vsrc")
+        self.asrc = self.pipeline.get_by_name("asrc")
+        self._on_error = on_error
+        self._handlers = Handlers()  # subclasses connect their callbacks through this
+        self._bus = self.pipeline.get_bus()
+        self._bus.add_watch(GLib.PRIORITY_DEFAULT, self._on_bus)
+
+    def _on_bus(self, _bus: Gst.Bus, msg: Gst.Message) -> bool:
+        if msg.type == Gst.MessageType.ERROR:
+            err, debug = msg.parse_error()
+            log.error("encoder pipeline error: %s (%s)", err.message, debug)
+            self._on_error(err.message)
+        return True
+
+    def start(self) -> None:
+        if self.pipeline.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
+            raise RuntimeError("could not start the encoder pipeline")
+
+    def close(self) -> None:
+        self.pipeline.set_state(Gst.State.NULL)
+        self._bus.remove_watch()
+        self._handlers.release()
+
+    def signal(self, msg: dict) -> None:
+        """Transport signaling from the browser (WebRTC answer / ICE candidates)."""
+
+
+class DvdSession:
+    """A virtual DVD player: plays one disc image and streams it to one browser.
+
+    make_output(geometry, on_error) builds the OutputPipeline that decides how the
+    stream travels (WebRTC or fragmented MP4 over the WebSocket). on_event receives
+    JSON-able state updates for the UI; like all callbacks here it fires on
+    GStreamer threads.
     """
 
     def __init__(
         self,
         device: str,
         info: DiscInfo,
-        on_init: Callable[[bytes, str], None],
-        on_segment: Callable[[bytes], None],
+        make_output: Callable[[StreamGeometry, Callable[[str], None]], OutputPipeline],
         on_event: Callable[[dict], None],
-        crf: int = 20,
     ):
         self.geometry = StreamGeometry.for_disc(info)
-        self._on_init = on_init
         self._on_event = on_event
         self._lock = threading.Lock()
         self._closed = False
@@ -390,32 +442,13 @@ class DvdSession:
             on_message=self._on_dvd_message,
         )
 
-        self.out = Gst.parse_launch(
-            f"""
-            appsrc name=vsrc is-live=true format=time do-timestamp=false max-bytes=0
-                caps="{geo.video_caps},framerate={geo.fps_n}/{geo.fps_d}" !
-              queue max-size-buffers=8 max-size-bytes=0 max-size-time=0 !
-              x264enc tune=zerolatency speed-preset=veryfast pass=qual quantizer={crf}
-                key-int-max={2 * geo.fps_n // geo.fps_d} !
-              video/x-h264,profile=high !
-              h264parse ! queue ! mux.
-            appsrc name=asrc is-live=true format=time do-timestamp=false max-bytes=0 caps="{AUDIO_CAPS}" !
-              queue ! audioconvert ! avenc_aac bitrate=192000 ! aacparse ! queue ! mux.
-            mp4mux name=mux fragment-duration=1 streamable=true !
-              appsink name=sink sync=false emit-signals=true
-            """
-        )
-        self.pacer = MediaPacer(self.out, self.out.get_by_name("vsrc"), self.out.get_by_name("asrc"), geo)
-        self._splitter = Mp4Splitter(self._got_init, on_segment)
-        self.out.get_by_name("sink").connect("new-sample", self._on_output)
-        self._out_bus = self.out.get_bus()
-        self._out_bus.add_watch(GLib.PRIORITY_DEFAULT, self._on_out_message)
+        self.output = make_output(geo, lambda message: self._emit({"type": "error", "message": f"Streaming failed: {message}"}))
+        self.pacer = MediaPacer(self.output.pipeline, self.output.vsrc, self.output.asrc, geo)
 
     # ---- lifecycle ------------------------------------------------------------
 
     def start(self) -> None:
-        if self.out.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
-            raise RuntimeError("could not start the encoder pipeline")
+        self.output.start()
         self.pacer.start()
         if self.dvd.set_state(Gst.State.PLAYING) == Gst.StateChangeReturn.FAILURE:
             raise RuntimeError("could not open the disc")
@@ -428,8 +461,7 @@ class DvdSession:
             self._closed = True  # the status timer sees this and removes itself
         self.pacer.stop()
         self.dvd.close()
-        self.out.set_state(Gst.State.NULL)
-        self._out_bus.remove_watch()
+        self.output.close()
 
     # ---- commands from the browser ---------------------------------------------
 
@@ -455,6 +487,8 @@ class DvdSession:
             self.chapter(int(msg.get("delta", 1)))
         elif kind == "title":
             self.play_title(int(msg["title"]))
+        elif kind in ("answer", "ice"):
+            self.output.signal(msg)
         else:
             log.debug("unknown command %r", msg)
 
@@ -609,25 +643,6 @@ class DvdSession:
         if status != self._status:
             self._status = status
             self._emit(dict(status))
-        return True
-
-    # ---- output side -----------------------------------------------------------
-
-    def _on_output(self, sink: Gst.Element) -> Gst.FlowReturn:
-        sample = sink.emit("pull-sample")
-        if sample is not None:
-            buf = sample.get_buffer()
-            self._splitter.feed(buf.extract_dup(0, buf.get_size()))
-        return Gst.FlowReturn.OK
-
-    def _got_init(self, init: bytes) -> None:
-        self._on_init(init, codecs_from_init(init))
-
-    def _on_out_message(self, _bus: Gst.Bus, msg: Gst.Message) -> bool:
-        if msg.type == Gst.MessageType.ERROR:
-            err, debug = msg.parse_error()
-            log.error("encoder pipeline error: %s (%s)", err.message, debug)
-            self._emit({"type": "error", "message": f"Streaming failed: {err.message}"})
         return True
 
     def _emit(self, event: dict) -> None:
