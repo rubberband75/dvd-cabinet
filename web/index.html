@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#0b0d12">
+  <title>DVD Cabinet</title>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 48 48'%3E%3Ccircle cx='24' cy='24' r='22' fill='%23f5b53d'/%3E%3Ccircle cx='24' cy='24' r='7' fill='%230b0d12'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/static/style.css?v=__VERSION__">
+</head>
+<body>
+  <!-- Library ---------------------------------------------------------------->
+  <section id="library" class="library hidden">
+    <header class="lib-header">
+      <svg class="logo" viewBox="0 0 48 48" aria-hidden="true">
+        <defs>
+          <linearGradient id="disc-sheen" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0" stop-color="#ffe0a3"/><stop offset=".45" stop-color="#f5b53d"/><stop offset="1" stop-color="#b8740c"/>
+          </linearGradient>
+        </defs>
+        <circle cx="24" cy="24" r="22" fill="url(#disc-sheen)"/>
+        <circle cx="24" cy="24" r="16" fill="none" stroke="#fff" stroke-opacity=".28"/>
+        <circle cx="24" cy="24" r="11" fill="none" stroke="#fff" stroke-opacity=".18"/>
+        <circle cx="24" cy="24" r="7" fill="#0b0d12"/>
+      </svg>
+      <div>
+        <h1>DVD Cabinet</h1>
+        <p class="tagline">Your discs, menus and all.</p>
+      </div>
+      <span id="lib-count" class="lib-count"></span>
+    </header>
+    <main id="grid" class="grid" aria-live="polite"></main>
+    <div id="lib-empty" class="lib-empty hidden">
+      <h2>No discs yet</h2>
+      <p>Drop <code>.iso</code> images (or ripped <code>VIDEO_TS</code> folders) into your library folder and they'll show up here.</p>
+    </div>
+  </section>
+
+  <!-- Player ----------------------------------------------------------------->
+  <section id="player" class="player hidden">
+    <header class="player-top">
+      <button id="btn-back" class="icon-btn" title="Back to library" aria-label="Back to library" data-icon="back"></button>
+      <div class="now-playing">
+        <div id="np-title" class="np-title"></div>
+        <div id="np-status" class="np-status"></div>
+      </div>
+      <button id="btn-help" class="icon-btn" title="Keyboard shortcuts (?)" aria-label="Keyboard shortcuts" data-icon="help"></button>
+    </header>
+
+    <div id="stage" class="stage">
+      <video id="video" playsinline disablepictureinpicture></video>
+
+      <div id="ov-loading" class="overlay">
+        <div class="spinner"></div>
+        <p>Loading disc…</p>
+      </div>
+      <div id="ov-start" class="overlay hidden">
+        <button id="btn-start" class="big-play" aria-label="Start playback" data-icon="play"></button>
+        <p>Click to start</p>
+      </div>
+      <div id="ov-message" class="overlay hidden">
+        <div class="message-box">
+          <h2 id="msg-title"></h2>
+          <p id="msg-text"></p>
+          <div class="message-actions">
+            <button id="btn-restart" class="pill-btn accent">Play again</button>
+            <button id="btn-msg-back" class="pill-btn">Back to library</button>
+          </div>
+        </div>
+      </div>
+
+      <div id="paused-badge" class="paused-badge hidden"><span data-icon="pause"></span> Paused</div>
+      <div id="toast" class="toast"></div>
+
+      <div id="remote" class="remote hidden" aria-label="DVD remote">
+        <div class="remote-row">
+          <button class="pill-btn" data-cmd="menu" title="Menu (M)">Menu</button>
+          <button class="pill-btn" data-cmd="title_menu" title="Title menu (T)">Title</button>
+        </div>
+        <div class="dpad">
+          <button data-key="up" aria-label="Up" data-icon="up" class="up"></button>
+          <button data-key="left" aria-label="Left" data-icon="left" class="left"></button>
+          <button data-key="enter" aria-label="Select" class="ok">OK</button>
+          <button data-key="right" aria-label="Right" data-icon="right" class="right"></button>
+          <button data-key="down" aria-label="Down" data-icon="down" class="down"></button>
+        </div>
+        <div class="remote-row">
+          <button class="icon-btn" data-action="prev" aria-label="Previous chapter" data-icon="prev"></button>
+          <button class="icon-btn" data-action="pause" aria-label="Play / pause" data-icon="playpause"></button>
+          <button class="icon-btn" data-action="next" aria-label="Next chapter" data-icon="next"></button>
+        </div>
+      </div>
+
+      <div id="titles-pop" class="popover hidden">
+        <div class="popover-head">Titles on this disc</div>
+        <ol id="titles-list" class="titles-list"></ol>
+      </div>
+
+      <div id="help" class="overlay help hidden">
+        <div class="message-box">
+          <h2>Remote control</h2>
+          <table class="keys">
+            <tr><td><kbd>↑</kbd><kbd>↓</kbd><kbd>←</kbd><kbd>→</kbd></td><td>Move around DVD menus<br><span class="muted">while watching, <kbd>←</kbd><kbd>→</kbd> skip 10 s</span></td></tr>
+            <tr><td><kbd>Enter</kbd></td><td>Select the highlighted button</td></tr>
+            <tr><td><kbd>Space</kbd> <kbd>K</kbd></td><td>Play / pause</td></tr>
+            <tr><td><kbd>M</kbd></td><td>Disc menu (press again to resume)</td></tr>
+            <tr><td><kbd>T</kbd></td><td>Title menu</td></tr>
+            <tr><td><kbd>,</kbd> <kbd>.</kbd></td><td>Previous / next chapter</td></tr>
+            <tr><td><kbd>F</kbd></td><td>Fullscreen</td></tr>
+            <tr><td><kbd>R</kbd></td><td>Show / hide the on-screen remote</td></tr>
+          </table>
+          <p class="muted">You can also point at menu buttons with the mouse and click them.</p>
+          <div class="message-actions"><button id="btn-help-close" class="pill-btn accent">Got it</button></div>
+        </div>
+      </div>
+    </div>
+
+    <footer class="controls">
+      <button class="icon-btn" data-action="prev" title="Previous chapter (,)" aria-label="Previous chapter" data-icon="prev"></button>
+      <button id="btn-play" class="icon-btn" data-action="pause" title="Play / pause (Space)" aria-label="Play / pause" data-icon="pause"></button>
+      <button class="icon-btn" data-action="next" title="Next chapter (.)" aria-label="Next chapter" data-icon="next"></button>
+
+      <div id="seek" class="seek hidden">
+        <span id="t-pos" class="time">0:00</span>
+        <input id="seek-range" type="range" min="0" max="100" step="1" value="0" aria-label="Seek">
+        <span id="t-dur" class="time">0:00</span>
+      </div>
+      <div id="menu-hint" class="menu-hint">DVD menu: use the arrow keys and Enter, or click a button</div>
+
+      <button class="pill-btn" data-cmd="menu" title="Disc menu (M)">Menu</button>
+      <button class="pill-btn hide-sm" data-cmd="title_menu" title="Title menu (T)">Title menu</button>
+      <button id="btn-titles" class="icon-btn" title="Titles" aria-label="Titles" data-icon="list"></button>
+      <button id="btn-remote" class="icon-btn" title="On-screen remote (R)" aria-label="On-screen remote" data-icon="remote"></button>
+      <button id="btn-fs" class="icon-btn" title="Fullscreen (F)" aria-label="Fullscreen" data-icon="expand"></button>
+    </footer>
+  </section>
+
+  <script src="/static/app.js?v=__VERSION__"></script>
+</body>
+</html>
