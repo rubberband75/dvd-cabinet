@@ -106,11 +106,19 @@ class UdpMux(asyncio.DatagramProtocol):
         if self.transport is not None:
             self.transport.close()
 
-    def candidate(self) -> str:
-        """The ICE candidate browsers outside the network use: the router's public address and our port."""
-        priority = (100 << 24) | (65535 << 8) | 255  # RFC 8445 server-reflexive type preference
-        return (f"candidate:mux 1 UDP {priority} {self.public_ip} {self.port} "
-                f"typ srflx raddr {self.lan_ip} rport {self.port}")
+    def candidates(self) -> list[str]:
+        """ICE candidates that reach sessions through this port.
+
+        The public one is for browsers outside the network. The LAN one has the lowest
+        priority, so browsers at home still connect straight to a session, but can use
+        this port when a firewall on the server only lets this one port through.
+        """
+        public = (100 << 24) | (65535 << 8) | 255  # RFC 8445 server-reflexive type preference
+        lan = (0 << 24) | (65535 << 8) | 255
+        return [
+            f"candidate:mux 1 UDP {public} {self.public_ip} {self.port} typ srflx raddr {self.lan_ip} rport {self.port}",
+            f"candidate:muxlan 1 UDP {lan} {self.lan_ip} {self.port} typ host",
+        ]
 
     # Called from GStreamer threads; the mux itself lives on the asyncio loop.
     def attach(self, ufrag: str, session_port: int) -> None:

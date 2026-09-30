@@ -47,7 +47,8 @@ server. Your disc images are only ever read.
 
 ### Requirements
 
-Linux with GStreamer 1.22+ and PyGObject. On Ubuntu / Linux Mint / Debian:
+Linux with GStreamer 1.20+ (e.g. Ubuntu 22.04 or newer, Debian 12) and PyGObject.
+On Ubuntu / Linux Mint / Debian:
 
 ```bash
 sudo apt install python3-venv python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins-base-1.0 \
@@ -59,9 +60,14 @@ sudo apt install python3-venv python3-gi gir1.2-gstreamer-1.0 gir1.2-gst-plugins
 Without the last two packages everything still works, just streamed over the
 WebSocket with more lag (the server logs which one is missing).
 
-Images of copy-protected (CSS) discs also need `libdvdcss2`; on Ubuntu/Mint that
-comes from `sudo apt install libdvd-pkg && sudo dpkg-reconfigure libdvd-pkg`.
-Everything above is already present on this machine.
+Images of copy-protected (CSS) discs, which is most commercial DVDs, also need
+`libdvdcss2`; on Ubuntu/Mint/Debian that comes from
+`sudo apt install libdvd-pkg && sudo dpkg-reconfigure libdvd-pkg` (on Debian,
+enable the `contrib` component first). The server warns at startup if it's missing.
+
+If the server has a firewall (ufw, or the Proxmox firewall for a container),
+allow the web port (`DVD_PORT`, 8080/tcp) and, with `DVD_RTC_PORT` set, that UDP
+port. That one UDP port is enough for WebRTC from home as well as from outside.
 
 ## Controls
 

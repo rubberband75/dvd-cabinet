@@ -33,6 +33,7 @@ from .gstutil import (
     Gst,
     GstVideo,
     Handlers,
+    deinterlace_method,
     dvd_format,
     navigation_command,
     navigation_key,
@@ -125,10 +126,12 @@ class DvdPipeline:
         self.pipeline = Gst.Pipeline.new("dvd")
         self.dvd = make("rsndvdbin", device=device)
         self.spu = make("dvdspu")  # renders subtitles and menu button highlights
+        deinterlace = make("deinterlace", fields="top")
+        Gst.util_set_object_arg(deinterlace, "method", deinterlace_method(deinterlace))
         video_chain = [
             self.spu,
             make("queue", max_size_buffers=3, max_size_bytes=0, max_size_time=0),
-            make("deinterlace", method="yadif", fields="top"),  # greedyh garbles planar video in 1.24
+            deinterlace,
             make("videoconvert"),
             make("videoscale", add_borders=True),
             make("capsfilter", caps=Gst.Caps.from_string(video_caps)),

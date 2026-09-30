@@ -196,7 +196,8 @@ class WebRtcOutput(OutputPipeline):
             # then tell the browser about the shared port.
             self._muxed = True
             self._mux.attach(self._ufrag, int(parts[5]))
-            self._on_signal({"type": "ice", "sdpMLineIndex": mline, "candidate": self._mux.candidate()})
+            for extra in self._mux.candidates():
+                self._on_signal({"type": "ice", "sdpMLineIndex": mline, "candidate": extra})
 
     def close(self) -> None:
         if self._muxed:

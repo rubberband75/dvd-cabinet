@@ -116,6 +116,9 @@ def main() -> None:
     if not args.dvd_logs:
         gstutil.filter_native_output()
     gstutil.init()
+    if not gstutil.have_libdvdcss():
+        logging.warning("libdvdcss isn't installed, so copy-protected discs (most commercial DVDs) won't play. "
+                        "On Debian/Ubuntu: sudo apt install libdvd-pkg && sudo dpkg-reconfigure libdvd-pkg")
 
     from aiohttp import web
 

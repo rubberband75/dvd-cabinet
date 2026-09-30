@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ctypes.util
 import logging
 import os
 import re
@@ -111,24 +112,45 @@ def struct_uint64_array(structure: Gst.Structure, field: str) -> list[int]:
     return [int(v) for v in m.group(1).split(",") if v.strip()]
 
 
+# Navigation events are built from their structure rather than with
+# GstVideo.Navigation.event_new_*(), which only exist since GStreamer 1.22; the
+# structure format is the same on every version, so this works on 1.20 too.
+def _navigation(fields: str) -> Gst.Event:
+    return Gst.Event.new_navigation(Gst.Structure.new_from_string(f"application/x-gst-navigation, {fields}"))
+
+
 def navigation_key(key: str) -> Gst.Event:
-    return GstVideo.Navigation.event_new_key_press(key, GstVideo.NavigationModifierType.NONE)
+    return _navigation(f"event=(string)key-press, key=(string){key}")
 
 
 def navigation_command(command: GstVideo.NavigationCommand) -> Gst.Event:
-    return GstVideo.Navigation.event_new_command(command)
+    return _navigation(f"event=(string)command, command-code=(uint){int(command)}")
 
 
 def navigation_mouse_move(x: float, y: float) -> Gst.Event:
-    return GstVideo.Navigation.event_new_mouse_move(x, y, GstVideo.NavigationModifierType.NONE)
+    return _navigation(f"event=(string)mouse-move, button=(int)0, pointer_x=(double){x:f}, pointer_y=(double){y:f}")
 
 
 def navigation_mouse_click(x: float, y: float) -> list[Gst.Event]:
-    none = GstVideo.NavigationModifierType.NONE
     return [
-        GstVideo.Navigation.event_new_mouse_button_press(1, x, y, none),
-        GstVideo.Navigation.event_new_mouse_button_release(1, x, y, none),
+        _navigation(f"event=(string){kind}, button=(int)1, pointer_x=(double){x:f}, pointer_y=(double){y:f}")
+        for kind in ("mouse-button-press", "mouse-button-release")
     ]
+
+
+def deinterlace_method(element: Gst.Element) -> str:
+    """The best deinterlacer the installed GStreamer has (YADIF arrived in 1.22).
+
+    greedyh is skipped on purpose: it garbles planar video (checked on 1.24).
+    """
+    pspec = element.find_property("method")
+    available = {v.value_nick for v in pspec.enum_class.__enum_values__.values()}
+    return next(m for m in ("yadif", "greedyl", "linear") if m in available)
+
+
+def have_libdvdcss() -> bool:
+    """libdvdread loads libdvdcss at runtime to decrypt copy-protected (CSS) discs."""
+    return ctypes.util.find_library("dvdcss") is not None
 
 
 def filter_native_output(prefixes: tuple[bytes, ...] = (b"libdvdread:", b"libdvdnav:", b"libdvdcss")) -> None:
@@ -150,7 +172,10 @@ def filter_native_output(prefixes: tuple[bytes, ...] = (b"libdvdread:", b"libdvd
         def pump(read_fd: int = read_fd, original: int = original) -> None:
             with os.fdopen(read_fd, "rb") as pipe:
                 for line in iter(pipe.readline, b""):
-                    if not line.lstrip().startswith(prefixes):
-                        os.write(original, line)
+                    text = line.strip()
+                    # libdvdread's "No css library available" box is all ** lines; we log that once
+                    if text.startswith(prefixes) or (text.startswith(b"*") and text.endswith(b"*")):
+                        continue
+                    os.write(original, line)
 
         threading.Thread(target=pump, name=f"output-filter-{fd}", daemon=True).start()
