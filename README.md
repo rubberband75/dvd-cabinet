@@ -12,16 +12,38 @@ mouse, or an on-screen remote, just like a DVD player.
 ```
 
 Then open <http://localhost:8080/> (or `http://<this-machine's-ip>:8080/` from
-another device on your network).
+another device on your network). The first visit asks you to **claim the server**
+by creating the admin account; see [Accounts](#accounts).
 
-Put `.iso` images, or ripped folders that contain `VIDEO_TS/`, in `DVDs/`,
-or point at another folder with `./run.sh --library /path/to/discs`. New discs
-appear the next time you open or reload the library page, with no server
-restart. The first time a disc is seen, the
+Your discs are `.iso` images, or ripped folders that contain `VIDEO_TS/`. On first
+run the `DVDs/` folder next to `run.sh` (or `DVD_LIBRARY`) is added to the library;
+add more folders, anywhere on the server, under **Server settings → Library**, and
+press **Scan for new discs** when you add images. The first time a disc is seen, the
 server plays it for a few seconds in the background and uses a screenshot of its
 menu as the thumbnail. To use your own artwork instead, put an image next to the
 disc with the same name (`Movie.iso` → `Movie.jpg`), or a `cover.jpg` inside a
 rip folder.
+
+## Accounts
+
+Everyone signs in; nothing but the sign-in page is reachable without an account.
+
+* **Claiming the server:** while no accounts exist, the web page offers to create
+  the admin account. From the local network that's all it takes. From anywhere
+  else (for example through your reverse proxy) it also asks for a setup code,
+  printed in the server's log at startup, so a stranger who finds the site first
+  can't claim it.
+* **Server settings** (admins, from the menu under your name): add people, set
+  their passwords, make them admins or delete them (whatever they're watching
+  stops), and manage the library folders.
+* Anyone can change their own password from the same menu; that signs them out
+  on their other devices.
+* Ten wrong passwords in 15 minutes lock that account and address out for a while.
+
+Everything the server keeps (a SQLite database with the accounts, sign-in
+sessions and library folders, plus the thumbnail cache) lives in one folder,
+`DVD_DATA_DIR` (default `data/`). Back that folder up and you've backed up the
+server. Your disc images are only ever read.
 
 ### Requirements
 
@@ -86,6 +108,8 @@ browser ─► WebSocket ─► server: keys / mouse / remote, plus the WebRTC o
 * `dvdcabinet/webrtc.py`: the WebRTC output; `dvdcabinet/fmp4.py`: the WebSocket fallback.
 * `dvdcabinet/server.py`: HTTP API, thumbnails, and one session per WebSocket.
 * `dvdcabinet/library.py`: finds discs and makes the menu thumbnails.
+* `dvdcabinet/accounts.py`, `db.py`: users, passwords and sessions in SQLite;
+  `web_auth.py`: sign-in and the guards on every route; `admin.py`: Server settings.
 * `dvdcabinet/discinfo.py`: reads NTSC/PAL and 4:3 vs 16:9 from the disc's IFO files, so
   each stream is shaped to fit its disc (a 4:3 disc gets a 4:3 stream with no side bars).
 * `web/`: the library grid and the player (plain HTML/CSS/JS, no build step).
@@ -97,14 +121,14 @@ variables of the same name, and command-line flags, override it:
 
 | `.env` | Flag | Default | |
 | --- | --- | --- | --- |
-| `DVD_LIBRARY` | `--library` | `DVDs` | folder to scan |
+| `DVD_DATA_DIR` | `--data-dir` | `data` | database and thumbnails |
+| `DVD_LIBRARY` | `--library` | `DVDs` | library folder added on the very first run |
 | `DVD_HOST` | `--host` | `0.0.0.0` | all interfaces; `127.0.0.1` for this machine only |
 | `DVD_PORT` | `--port` | `8080` | web port |
 | `DVD_CRF` | `--crf` | `20` | video quality, lower is better (18–23 is sensible) |
 | `DVD_WEBRTC_CODEC` | `--webrtc-codec` | `auto` | `auto` (H.264 if the browser has it), `h264`, `vp8` |
 | `DVD_RTC_PORT` | `--rtc-port` | | UDP port for WebRTC from outside (see below) |
 | `DVD_PUBLIC_IP` | `--public-ip` | | your router's public address (see below) |
-| `DVD_CACHE` | `--cache` | `.cache` | where thumbnails live |
 
 Also `--no-webrtc` (always stream over the WebSocket), `--dvd-logs` (show
 libdvdread/libdvdnav output) and `-v` (verbose logging). Adding `?transport=mse`
@@ -128,8 +152,8 @@ Without the port forward, remote viewers get the WebSocket fallback, which works
 through any proxy. The log shows each viewer's real address if the proxy sends
 `X-Real-IP`.
 
-The server has no login of its own, so on the internet put one in front of it,
-for example basic auth in nginx (`auth_basic` / `auth_basic_user_file`).
+Sign-in cookies are marked Secure when the proxy says the visit was HTTPS
+(`X-Forwarded-Proto`), so serve the site over HTTPS.
 
 ## Good to know
 
@@ -143,8 +167,8 @@ for example basic auth in nginx (`auth_basic` / `auth_basic_user_file`).
   and switches to the WebSocket fallback on its own.
 * Audio is mixed down to stereo. Audio and subtitle languages are switched with
   the disc's own setup menus, as on a TV.
-* The server has no login and no HTTPS of its own, which is fine on a home
-  network. On the internet, use a proxy with HTTPS and a login (see above).
+* The server doesn't do HTTPS itself. On the internet, put it behind a proxy
+  that does (see above).
 * Tested with Firefox. Chrome, Edge and Safari support WebRTC with H.264 as well;
   on the fallback path iPhones need iOS 17.1 or newer.
 * Some discs have quirks built into their menus. On *Buzz Lightyear*, the first

@@ -232,3 +232,122 @@ kbd {
   .lib-header { padding-top: 24px; }
   .dpad { grid-template-columns: repeat(3, 46px); grid-template-rows: repeat(3, 46px); }
 }
+
+/* ---- Sign in / claim ------------------------------------------------------ */
+
+.auth {
+  min-height: 100vh; display: grid; place-items: center; padding: 24px 16px;
+  background: radial-gradient(900px 500px at 50% -10%, rgba(245, 181, 61, .12), transparent 60%), var(--bg);
+}
+.auth-card {
+  width: min(400px, 100%); display: grid; gap: 14px; padding: 30px 28px;
+  border-radius: 20px; border: 1px solid var(--line); background: var(--bg-raised);
+  box-shadow: 0 20px 50px rgba(0, 0, 0, .5);
+}
+.auth-card .logo { width: 52px; height: 52px; }
+.auth-card h1 { margin: 0; font-size: 24px; }
+.auth-card p { margin: 0; }
+label { display: grid; gap: 6px; font-size: 13px; font-weight: 650; color: #c9cfdc; }
+label.check { display: flex; align-items: center; gap: 8px; font-weight: 600; }
+input:not([type="checkbox"]):not([type="range"]) {
+  width: 100%; height: 40px; padding: 0 12px; border-radius: 10px; border: 1px solid var(--line);
+  background: #0e1219; color: var(--text); font: inherit; font-size: 15px;
+}
+input:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; border-color: transparent; }
+input[type="checkbox"] { width: 18px; height: 18px; accent-color: var(--accent); }
+.hint { font-weight: 400; color: var(--muted); font-size: 12.5px; }
+.form-error { margin: 0; min-height: 1em; color: #ff8a80; font-size: 13.5px; }
+.form-error:empty { display: none; }
+.pill-btn.wide { width: 100%; height: 42px; font-size: 15px; }
+.pill-btn:disabled { opacity: .55; cursor: default; }
+a.pill-btn { display: inline-grid; place-items: center; text-decoration: none; color: inherit; }
+a.pill-btn.accent { color: var(--accent-ink); }
+
+/* ---- User menu ------------------------------------------------------------ */
+
+.user-menu { position: relative; }
+.lib-count + .user-menu { margin-left: 8px; }
+.user-btn {
+  display: flex; align-items: center; gap: 8px; height: 38px; padding: 0 12px 0 4px; cursor: pointer;
+  border-radius: 999px; border: 1px solid var(--line); background: var(--panel); font-weight: 650; font-size: 14px;
+}
+.user-btn:hover { background: var(--panel-2); }
+.avatar {
+  width: 30px; height: 30px; border-radius: 50%; display: grid; place-items: center;
+  background: var(--accent); color: var(--accent-ink); font-weight: 800; font-size: 13px; text-transform: uppercase;
+}
+.menu-pop {
+  position: absolute; right: 0; top: calc(100% + 8px); z-index: 20; min-width: 200px; padding: 6px;
+  border-radius: 14px; border: 1px solid var(--line); background: var(--bg-raised); box-shadow: 0 14px 36px rgba(0, 0, 0, .55);
+}
+.menu-pop a, .menu-pop button {
+  display: block; width: 100%; padding: 9px 12px; border: 0; border-radius: 9px; background: none;
+  color: var(--text); text-align: left; text-decoration: none; font-size: 14px; cursor: pointer;
+}
+.menu-pop a:hover, .menu-pop button:hover { background: rgba(255, 255, 255, .07); }
+.lib-empty .pill-btn { margin-top: 12px; height: 38px; padding: 0 18px; }
+
+/* ---- Server settings ------------------------------------------------------ */
+
+.admin { min-height: 100vh; background: var(--bg); padding-bottom: 48px; }
+.admin-header { display: flex; align-items: center; gap: 10px; padding: 28px clamp(16px, 5vw, 56px) 4px; }
+.admin-header h1 { margin: 0; font-size: 24px; }
+.admin-header .icon-btn { color: var(--text); }
+.tabs { display: flex; gap: 6px; padding: 14px clamp(16px, 5vw, 56px) 0; border-bottom: 1px solid #1a2030; }
+.tabs a {
+  padding: 10px 14px; color: var(--muted); text-decoration: none; font-weight: 650; font-size: 14px;
+  border-bottom: 2px solid transparent; margin-bottom: -1px;
+}
+.tabs a.current { color: var(--text); border-bottom-color: var(--accent); }
+.panel { display: grid; gap: 20px; padding: 22px clamp(16px, 5vw, 56px); max-width: 860px; }
+.card { padding: 20px 22px; border-radius: 16px; border: 1px solid var(--line); background: var(--bg-raised); }
+.card h2 { margin: 0 0 6px; font-size: 17px; }
+.card > p { margin: 0 0 14px; }
+.rows { list-style: none; margin: 0 0 14px; padding: 0; display: grid; gap: 8px; }
+.rows:empty { display: none; }
+.row {
+  display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 12px;
+  background: #0e1219; border: 1px solid #1c2334;
+}
+.row-main { flex: 1; min-width: 0; }
+.row-title { font-weight: 650; overflow-wrap: anywhere; }
+.row-sub { color: var(--muted); font-size: 13px; }
+.row-sub.bad { color: #ff8a80; }
+.row .pill-btn { height: 30px; padding: 0 12px; font-size: 12.5px; }
+.badge {
+  display: inline-block; margin-left: 8px; padding: 1px 8px; border-radius: 999px; font-size: 11.5px; font-weight: 700;
+  background: rgba(245, 181, 61, .16); color: var(--accent); vertical-align: 1px;
+}
+.badge.plain { background: rgba(255, 255, 255, .08); color: var(--muted); }
+.inline-form { display: flex; gap: 8px; flex-wrap: wrap; }
+.inline-form input { flex: 1 1 260px; }
+.inline-form .pill-btn { height: 40px; }
+.stack-form { display: grid; gap: 12px; max-width: 420px; }
+.stack-form .pill-btn { justify-self: start; height: 38px; padding: 0 18px; }
+.danger { color: #ff8a80 !important; }
+
+/* ---- Dialog --------------------------------------------------------------- */
+
+.dlg {
+  width: min(480px, calc(100vw - 32px)); padding: 0; border-radius: 18px; border: 1px solid var(--line);
+  background: var(--bg-raised); color: var(--text); box-shadow: 0 20px 60px rgba(0, 0, 0, .6);
+}
+.dlg::backdrop { background: rgba(0, 0, 0, .6); }
+.dlg form { display: grid; gap: 14px; padding: 22px 24px; }
+.dlg h2 { margin: 0; font-size: 19px; }
+.dlg #dlg-body { display: grid; gap: 12px; }
+.dlg p { margin: 0; }
+.dlg .message-actions { margin-top: 4px; }
+.browser-path { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: 13px; overflow-wrap: anywhere; }
+.browser-list {
+  list-style: none; margin: 0; padding: 4px; max-height: 300px; overflow: auto; border-radius: 12px;
+  border: 1px solid #1c2334; background: #0e1219; scrollbar-width: thin; scrollbar-color: #3a4561 transparent;
+}
+.browser-list button {
+  width: 100%; display: flex; gap: 10px; align-items: center; padding: 8px 10px; border: 0; border-radius: 8px;
+  background: none; color: var(--text); text-align: left; font-size: 14px; cursor: pointer;
+}
+.browser-list button:hover { background: rgba(255, 255, 255, .07); }
+.browser-list .folder-icon { color: var(--accent); flex: none; }
+.browser-list .empty { padding: 10px; color: var(--muted); font-size: 13px; }
+.page-toast { position: fixed; top: 20px; z-index: 50; border: 1px solid var(--line); }

@@ -54,6 +54,191 @@ function fmtTime(sec) {
 const fmtRuntime = (sec) => { const m = Math.round(sec / 60); return m >= 60 ? `${Math.floor(m / 60)} h ${m % 60} min` : `${m} min`; };
 const fmtSize = (b) => (b >= 1e9 ? `${(b / 1e9).toFixed(1)} GB` : `${Math.round(b / 1e6)} MB`);
 
+function ago(ts) {
+  if (!ts) return 'never';
+  const s = Math.max(0, Date.now() / 1000 - ts);
+  if (s < 60) return 'just now';
+  if (s < 3600) return `${Math.round(s / 60)} min ago`;
+  if (s < 86400) return `${Math.round(s / 3600)} h ago`;
+  const d = Math.round(s / 86400);
+  return d === 1 ? 'yesterday' : `${d} days ago`;
+}
+
+function el(tag, props = {}, ...children) {
+  const node = Object.assign(document.createElement(tag), props);
+  node.append(...children.filter((c) => c != null));
+  return node;
+}
+
+class ApiError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+
+// JSON in, JSON out. Being signed out (401) sends you to the sign-in screen.
+async function api(method, url, body) {
+  const res = await fetch(url, {
+    method,
+    headers: body === undefined ? {} : { 'Content-Type': 'application/json' },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  let data = {};
+  try { data = await res.json(); } catch { /* empty body */ }
+  if (res.status === 401 && !url.startsWith('/api/auth/')) {
+    Auth.user = null;
+    route();
+  }
+  if (!res.ok) throw new ApiError(res.status, data.error || `Request failed (${res.status})`);
+  return data;
+}
+
+// The single <dialog>, filled in per use. onOk may throw to show an error and stay open.
+function openDialog({ title, body, ok = 'OK', danger = false, onOk }) {
+  const dlg = $('dlg');
+  $('dlg-title').textContent = title;
+  $('dlg-body').replaceChildren(...[].concat(body || []));
+  $('dlg-error').textContent = '';
+  const okBtn = $('dlg-ok');
+  okBtn.textContent = ok;
+  okBtn.classList.toggle('danger', danger);
+  okBtn.disabled = false;
+  return new Promise((resolve) => {
+    const form = $('dlg-form');
+    const finish = (value) => {
+      form.onsubmit = null;
+      dlg.onclose = null;
+      if (dlg.open) dlg.close();
+      resolve(value);
+    };
+    form.onsubmit = async (e) => {
+      e.preventDefault();
+      if (e.submitter && e.submitter.value === 'cancel') return finish(null);
+      okBtn.disabled = true;
+      try {
+        finish(onOk ? await onOk() : true);
+      } catch (err) {
+        $('dlg-error').textContent = err.message;
+        okBtn.disabled = false;
+      }
+    };
+    dlg.onclose = () => finish(null);
+    dlg.showModal();
+    dlg.querySelector('input')?.focus();
+  });
+}
+
+/* ---- Sign in / claim ------------------------------------------------------ */
+
+const Auth = {
+  user: null,
+  checked: false,
+  setupRequired: false,
+  codeRequired: false,
+
+  async check() {
+    const state = await (await fetch('/api/auth/state')).json();
+    this.user = state.user;
+    this.setupRequired = state.setup_required;
+    this.codeRequired = state.setup_code_required;
+    this.checked = true;
+  },
+
+  init() {
+    $('auth-form').addEventListener('submit', (e) => { e.preventDefault(); this.submit(); });
+    $('btn-user').onclick = (e) => { e.stopPropagation(); this.toggleMenu(); };
+    document.addEventListener('click', () => this.toggleMenu(false));
+    $('menu-logout').onclick = () => this.logout();
+    $('menu-password').onclick = () => this.changePassword();
+  },
+
+  show() {
+    const setup = this.setupRequired;
+    $('auth').classList.remove('hidden');
+    document.title = setup ? 'Set up DVD Cabinet' : 'Sign in · DVD Cabinet';
+    $('auth-title').textContent = setup ? 'Claim this server' : 'Sign in';
+    $('auth-text').textContent = setup
+      ? 'Welcome to DVD Cabinet. Create the admin account; you can add more people afterwards.'
+      : 'Sign in to watch your discs.';
+    $('auth-pass').autocomplete = setup ? 'new-password' : 'current-password';
+    $('auth-confirm-row').classList.toggle('hidden', !setup);
+    $('auth-code-row').classList.toggle('hidden', !(setup && this.codeRequired));
+    $('auth-submit').textContent = setup ? 'Create admin account' : 'Sign in';
+    $('auth-error').textContent = '';
+    $('auth-user').focus();
+  },
+
+  hide() { $('auth').classList.add('hidden'); },
+
+  async submit() {
+    const setup = this.setupRequired;
+    const username = $('auth-user').value.trim();
+    const password = $('auth-pass').value;
+    const error = $('auth-error');
+    if (!username || !password) { error.textContent = 'Enter a username and password.'; return; }
+    if (setup && password !== $('auth-confirm').value) { error.textContent = "The passwords don't match."; return; }
+    $('auth-submit').disabled = true;
+    try {
+      const body = { username, password };
+      if (setup) body.setup_code = $('auth-code').value;
+      const res = await api('POST', setup ? '/api/auth/setup' : '/api/auth/login', body);
+      this.user = res.user;
+      this.setupRequired = false;
+      $('auth-form').reset();
+      if (setup) location.hash = '#/admin';
+      route();
+    } catch (err) {
+      error.textContent = err.message;
+      if (err.status === 409) { await this.check(); this.show(); } // someone else claimed it first
+    } finally {
+      $('auth-submit').disabled = false;
+    }
+  },
+
+  renderMenu() {
+    const u = this.user;
+    if (!u) return;
+    $('user-name').textContent = u.username;
+    $('user-avatar').textContent = u.username.slice(0, 1);
+    $('menu-admin').classList.toggle('hidden', !u.is_admin);
+  },
+
+  toggleMenu(force) {
+    const pop = $('user-pop');
+    const show = force ?? pop.classList.contains('hidden');
+    pop.classList.toggle('hidden', !show);
+    $('btn-user').setAttribute('aria-expanded', String(show));
+  },
+
+  async logout() {
+    await api('POST', '/api/auth/logout').catch(() => {});
+    this.user = null;
+    location.hash = '#/';
+    route();
+  },
+
+  changePassword() {
+    const current = el('input', { type: 'password', autocomplete: 'current-password', required: true });
+    const next = el('input', { type: 'password', autocomplete: 'new-password', required: true });
+    const again = el('input', { type: 'password', autocomplete: 'new-password', required: true });
+    return openDialog({
+      title: 'Change your password',
+      body: [el('label', {}, 'Current password', current), el('label', {}, 'New password', next),
+        el('label', {}, 'New password again', again)],
+      ok: 'Change password',
+      onOk: async () => {
+        if (next.value !== again.value) throw new Error("The new passwords don't match.");
+        await api('POST', '/api/auth/password', { current: current.value, new: next.value });
+        toast('Password changed. Other devices have been signed out.');
+      },
+    });
+  },
+};
+
+function toast(text) {
+  const t = el('div', { className: 'toast show page-toast', textContent: text });
+  document.body.append(t);
+  setTimeout(() => t.remove(), 3000);
+}
+
 /* ---- Library ------------------------------------------------------------ */
 
 const Library = {
@@ -63,6 +248,7 @@ const Library = {
   show() {
     $('library').classList.remove('hidden');
     document.title = 'DVD Cabinet';
+    Auth.renderMenu();
     this.refresh();
   },
 
@@ -74,24 +260,24 @@ const Library = {
 
   async refresh() {
     clearTimeout(this.timer);
-    let discs;
+    let discs, scanning;
     try {
-      const res = await fetch('/api/discs');
-      discs = (await res.json()).discs;
-    } catch {
-      this.timer = setTimeout(() => this.refresh(), 5000);
+      ({ discs, scanning } = await api('GET', '/api/discs'));
+    } catch (err) {
+      if (err.status !== 401) this.timer = setTimeout(() => this.refresh(), 5000);
       return;
     }
     this.discs = new Map(discs.map((d) => [d.id, d]));
     if ($('library').classList.contains('hidden')) return;
     this.render(discs);
-    if (discs.some((d) => d.thumbnail_state === 'pending')) this.timer = setTimeout(() => this.refresh(), 2500);
+    if (scanning || discs.some((d) => d.thumbnail_state === 'pending')) this.timer = setTimeout(() => this.refresh(), 2500);
   },
 
   render(discs) {
     const grid = $('grid');
     $('lib-count').textContent = discs.length ? `${discs.length} disc${discs.length === 1 ? '' : 's'}` : '';
     $('lib-empty').classList.toggle('hidden', discs.length > 0);
+    $('lib-empty-admin').classList.toggle('hidden', !Auth.user?.is_admin);
     const existing = new Map([...grid.children].map((el) => [el.dataset.id, el]));
     const cards = discs.map((d) => {
       const sig = JSON.stringify([d.title, d.thumbnail, d.thumbnail_state, d.runtime]);
@@ -524,7 +710,13 @@ const Player = {
       case 'autoplay-blocked': $('ov-loading').classList.add('hidden'); $('ov-start').classList.remove('hidden'); break;
       case 'ended': this.showMessage('The disc has finished', 'Thanks for watching.'); break;
       case 'error': this.showMessage('Playback problem', ev.message); break;
-      case 'disconnected': this.showMessage('Connection lost', 'The connection to the server was interrupted.'); break;
+      case 'disconnected':
+        this.stop();
+        Auth.check().then(() => {
+          if (!Auth.user) route(); // signed out (or the account was removed): back to sign-in
+          else this.showMessage('Connection lost', 'The connection to the server was interrupted.');
+        }, () => this.showMessage('Connection lost', 'The server is not reachable.'));
+        break;
       default: break;
     }
   },
@@ -738,19 +930,250 @@ const Player = {
   },
 };
 
+/* ---- Server settings (admins) ------------------------------------------- */
+
+const FOLDER_ICON = '<svg class="i folder-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M3 7a2 2 0 0 1 2-2h4l2 2h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></svg>';
+
+const Admin = {
+  timer: null,
+
+  init() {
+    $('folder-form').addEventListener('submit', (e) => { e.preventDefault(); this.addFolder($('folder-path').value); });
+    $('btn-browse').onclick = () => this.browse();
+    $('btn-scan').onclick = async () => this.renderLibrary(await api('POST', '/api/admin/library/scan'));
+    $('user-form').addEventListener('submit', (e) => { e.preventDefault(); this.addUser(); });
+  },
+
+  show(tab) {
+    $('admin').classList.remove('hidden');
+    document.title = 'Server settings · DVD Cabinet';
+    $('tab-library').classList.toggle('current', tab === 'library');
+    $('tab-users').classList.toggle('current', tab === 'users');
+    $('panel-library').classList.toggle('hidden', tab !== 'library');
+    $('panel-users').classList.toggle('hidden', tab !== 'users');
+    if (tab === 'users') this.loadUsers(); else this.loadLibrary();
+  },
+
+  hide() {
+    $('admin').classList.add('hidden');
+    clearTimeout(this.timer);
+  },
+
+  // -- library ------------------------------------------------------------------
+
+  async loadLibrary() {
+    clearTimeout(this.timer);
+    try {
+      this.renderLibrary(await api('GET', '/api/admin/library'));
+    } catch (err) {
+      $('folder-error').textContent = err.message;
+    }
+  },
+
+  renderLibrary(st) {
+    clearTimeout(this.timer);
+    $('folder-list').replaceChildren(...st.folders.map((f) => {
+      const remove = el('button', { className: 'pill-btn', textContent: 'Remove' });
+      remove.onclick = () => this.removeFolder(f);
+      const sub = f.exists ? `${f.discs} disc${f.discs === 1 ? '' : 's'}` : "Missing: the server can't see this folder right now";
+      return el('li', { className: 'row' },
+        el('div', { className: 'row-main' }, el('div', { className: 'row-title', textContent: f.path }),
+          el('div', { className: `row-sub${f.exists ? '' : ' bad'}`, textContent: sub })),
+        remove);
+    }));
+    let status;
+    if (st.scanning) status = 'Scanning…';
+    else if (!st.folders.length) status = 'Add a folder above, then its discs show up in the library.';
+    else if (st.last_scan) status = `Last scan ${ago(st.last_scan.finished)}: ${st.discs} disc${st.discs === 1 ? '' : 's'} in the library.`;
+    else status = 'Not scanned yet.';
+    if (st.thumbnails_pending) status += ` Making menu thumbnails for ${st.thumbnails_pending} disc${st.thumbnails_pending === 1 ? '' : 's'}…`;
+    $('scan-status').textContent = status;
+    $('btn-scan').disabled = st.scanning || !st.folders.length;
+    $('btn-scan').textContent = st.scanning ? 'Scanning…' : 'Scan for new discs';
+    if ((st.scanning || st.thumbnails_pending) && !$('admin').classList.contains('hidden')) {
+      this.timer = setTimeout(() => this.loadLibrary(), 1500);
+    }
+  },
+
+  async addFolder(path) {
+    $('folder-error').textContent = '';
+    try {
+      this.renderLibrary(await api('POST', '/api/admin/library/folders', { path: path.trim() }));
+      $('folder-path').value = '';
+    } catch (err) {
+      $('folder-error').textContent = err.message;
+    }
+  },
+
+  async removeFolder(folder) {
+    const ok = await openDialog({
+      title: 'Remove this folder?',
+      body: el('p', {}, 'Its discs leave the library. Nothing is deleted from ', el('code', { textContent: folder.path }), '.'),
+      ok: 'Remove',
+      danger: true,
+    });
+    if (ok) this.renderLibrary(await api('DELETE', `/api/admin/library/folders/${folder.id}`));
+  },
+
+  // A small file-manager view of the server's folders.
+  browse() {
+    const pathLine = el('div', { className: 'browser-path' });
+    const list = el('ul', { className: 'browser-list' });
+    const note = el('p', { className: 'muted' });
+    let current = null;
+    const load = async (path) => {
+      $('dlg-error').textContent = '';
+      let res;
+      try {
+        res = await api('GET', `/api/admin/browse?path=${encodeURIComponent(path)}`);
+      } catch (err) {
+        $('dlg-error').textContent = err.message;
+        return;
+      }
+      current = res.path;
+      pathLine.textContent = res.path;
+      const items = res.dirs.map((d) => {
+        const b = el('button', { type: 'button' });
+        b.innerHTML = FOLDER_ICON;
+        b.append(el('span', { textContent: d.name }));
+        b.onclick = () => load(d.path);
+        return el('li', {}, b);
+      });
+      if (res.parent) {
+        const up = el('button', { type: 'button' });
+        up.innerHTML = `${icon('up')}`;
+        up.append(el('span', { textContent: 'Up a level' }));
+        up.onclick = () => load(res.parent);
+        items.unshift(el('li', {}, up));
+      }
+      if (!res.dirs.length) items.push(el('li', { className: 'empty', textContent: 'No folders in here.' }));
+      list.replaceChildren(...items);
+      note.textContent = res.isos ? `${res.isos} disc image${res.isos === 1 ? '' : 's'} directly in this folder.` : '';
+    };
+    const start = $('folder-path').value.trim() || '/mnt';
+    load(start.startsWith('/') ? start : '/').then(() => { if (current === null) load('/'); });
+    return openDialog({
+      title: 'Choose a folder',
+      body: [pathLine, list, note],
+      ok: 'Use this folder',
+      onOk: async () => {
+        if (!current) throw new Error('Pick a folder first.');
+        this.renderLibrary(await api('POST', '/api/admin/library/folders', { path: current }));
+      },
+    });
+  },
+
+  // -- users --------------------------------------------------------------------
+
+  async loadUsers() {
+    try {
+      const { users } = await api('GET', '/api/admin/users');
+      this.renderUsers(users);
+    } catch (err) {
+      $('user-error').textContent = err.message;
+    }
+  },
+
+  renderUsers(users) {
+    const me = Auth.user;
+    $('user-list').replaceChildren(...users.map((u) => {
+      const title = el('div', { className: 'row-title', textContent: u.username });
+      if (u.is_admin) title.append(el('span', { className: 'badge', textContent: 'Admin' }));
+      if (u.id === me.id) title.append(el('span', { className: 'badge plain', textContent: 'You' }));
+      const actions = [];
+      const reset = el('button', { className: 'pill-btn', textContent: 'Set password' });
+      reset.onclick = () => this.resetPassword(u);
+      actions.push(reset);
+      if (u.id !== me.id) {
+        const role = el('button', { className: 'pill-btn', textContent: u.is_admin ? 'Remove admin' : 'Make admin' });
+        role.onclick = () => this.update(u, { is_admin: !u.is_admin });
+        const del = el('button', { className: 'pill-btn danger', textContent: 'Delete' });
+        del.onclick = () => this.deleteUser(u);
+        actions.push(role, del);
+      }
+      return el('li', { className: 'row' },
+        el('div', { className: 'row-main' }, title,
+          el('div', { className: 'row-sub', textContent: u.last_login_at ? `Last signed in ${ago(u.last_login_at)}` : 'Never signed in' })),
+        ...actions);
+    }));
+  },
+
+  async addUser() {
+    $('user-error').textContent = '';
+    try {
+      await api('POST', '/api/admin/users', {
+        username: $('new-user').value, password: $('new-pass').value, is_admin: $('new-admin').checked,
+      });
+      $('user-form').reset();
+      this.loadUsers();
+    } catch (err) {
+      $('user-error').textContent = err.message;
+    }
+  },
+
+  async update(user, change) {
+    try {
+      await api('PATCH', `/api/admin/users/${user.id}`, change);
+    } catch (err) {
+      toast(err.message);
+    }
+    this.loadUsers();
+  },
+
+  resetPassword(user) {
+    const pass = el('input', { type: 'password', autocomplete: 'new-password', required: true });
+    return openDialog({
+      title: `New password for ${user.username}`,
+      body: [el('label', {}, 'Password', pass),
+        el('p', { className: 'muted', textContent: "They'll be signed out everywhere and use this from now on." })],
+      ok: 'Set password',
+      onOk: () => api('PATCH', `/api/admin/users/${user.id}`, { password: pass.value }),
+    });
+  },
+
+  async deleteUser(user) {
+    const ok = await openDialog({
+      title: `Delete ${user.username}?`,
+      body: el('p', { textContent: "They're signed out right away and can't sign in again." }),
+      ok: 'Delete',
+      danger: true,
+      onOk: () => api('DELETE', `/api/admin/users/${user.id}`),
+    });
+    if (ok) this.loadUsers();
+  },
+};
+
 /* ---- Router ------------------------------------------------------------- */
 
-function route() {
-  const m = location.hash.match(/^#\/play\/([0-9a-f]+)$/);
-  if (m) {
-    Library.hide();
-    Player.show(m[1]);
-  } else {
-    Player.hide();
-    Library.show();
+const VIEWS = { auth: Auth, library: Library, player: Player, admin: Admin };
+
+function showOnly(name, ...args) {
+  for (const [key, view] of Object.entries(VIEWS)) if (key !== name) view.hide();
+  VIEWS[name].show(...args);
+}
+
+async function route() {
+  if (!Auth.checked || !Auth.user) {
+    try {
+      await Auth.check();
+    } catch {
+      setTimeout(route, 3000); // server not reachable yet
+      return;
+    }
   }
+  if (Auth.setupRequired || !Auth.user) return showOnly('auth');
+  const hash = location.hash;
+  const play = hash.match(/^#\/play\/([0-9a-f]+)$/);
+  if (play) return showOnly('player', play[1]);
+  if (hash.startsWith('#/admin')) {
+    if (!Auth.user.is_admin) { location.hash = '#/'; return; }
+    return showOnly('admin', hash === '#/admin/users' ? 'users' : 'library');
+  }
+  showOnly('library');
 }
 
 Player.init();
+Auth.init();
+Admin.init();
 window.addEventListener('hashchange', route);
 route();

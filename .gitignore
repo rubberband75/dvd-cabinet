@@ -1,5 +1,7 @@
 .venv/
 .cache/
+data/
 __pycache__/
 DVDs/
 .env
+tmp/

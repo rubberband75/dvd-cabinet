@@ -31,6 +31,7 @@ class Disc:
     mtime: float
     info: DiscInfo
     cover: str | None = None  # user-supplied artwork next to the image
+    folder: str = ""  # the library folder it was found in
     meta: dict = field(default_factory=dict)  # filled in by the thumbnailer
 
     @property
@@ -68,13 +69,17 @@ def _find_cover(stem: Path, folder: Path | None = None) -> str | None:
 
 
 class Library:
-    def __init__(self, root: Path, cache_dir: Path):
-        self.root = root.resolve()
+    """The discs found in the library folders. Scans run in the background, on request."""
+
+    def __init__(self, cache_dir: Path):
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
+        self.folders: list[Path] = []
         self._discs: dict[str, Disc] = {}
         self._info_cache: dict[tuple, DiscInfo] = {}
         self._lock = threading.Lock()
+        self._scan_thread: threading.Thread | None = None
+        self.last_scan: dict | None = None  # {"finished": time, "discs": n, "seconds": s}
         self._queue: queue.Queue[Disc] = queue.Queue()
         self._queued: set[str] = set()
         self._failed: set[str] = set()
@@ -82,32 +87,55 @@ class Library:
 
     # ---- scanning ---------------------------------------------------------------
 
-    def scan(self) -> list[Disc]:
+    def set_folders(self, folders: list[str]) -> None:
+        self.folders = [Path(f) for f in folders]
+
+    @property
+    def scanning(self) -> bool:
+        return self._scan_thread is not None and self._scan_thread.is_alive()
+
+    def scan_in_background(self) -> bool:
+        """Start a scan unless one is running; the disc list updates when it finishes."""
+        with self._lock:
+            if self.scanning:
+                return False
+            self._scan_thread = threading.Thread(target=self.scan, name="library-scan", daemon=True)
+            self._scan_thread.start()
+            return True
+
+    def scan(self) -> None:
+        started = time.monotonic()
         found: dict[str, Disc] = {}
-        for dirpath, dirnames, filenames in os.walk(self.root, followlinks=True):
-            dirnames.sort()
-            if any(d.upper() == "VIDEO_TS" for d in dirnames):
-                self._add(found, Path(dirpath), is_dir=True)
-                dirnames[:] = [d for d in dirnames if d.upper() != "VIDEO_TS"]
-            for name in sorted(filenames):
-                if name.lower().endswith(".iso"):
-                    self._add(found, Path(dirpath) / name, is_dir=False)
+        for folder in list(self.folders):
+            if not folder.is_dir():
+                log.warning("library folder %s is missing or not a folder", folder)
+                continue
+            for dirpath, dirnames, filenames in os.walk(folder, followlinks=True):
+                dirnames.sort()
+                dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+                if any(d.upper() == "VIDEO_TS" for d in dirnames):
+                    self._add(found, Path(dirpath), folder, is_dir=True)
+                    dirnames[:] = [d for d in dirnames if d.upper() != "VIDEO_TS"]
+                for name in sorted(filenames):
+                    if name.lower().endswith(".iso") and not name.startswith("."):
+                        self._add(found, Path(dirpath) / name, folder, is_dir=False)
         with self._lock:
             self._discs = found
+        self.last_scan = {"finished": int(time.time()), "discs": len(found),
+                          "seconds": round(time.monotonic() - started, 1)}
+        log.info("library scan: %d disc(s) in %d folder(s), %.1fs",
+                 len(found), len(self.folders), time.monotonic() - started)
         for disc in found.values():
             self._ensure_thumbnail(disc)
-        return sorted(found.values(), key=lambda d: d.title.lower())
 
-    def _add(self, found: dict[str, Disc], path: Path, is_dir: bool) -> None:
+    def _add(self, found: dict[str, Disc], path: Path, folder: Path, is_dir: bool) -> None:
         try:
             st = path.stat()
         except OSError:
             return
-        if path.resolve() == self.root and is_dir:
-            rel = path.name
-        else:
-            rel = str(path.relative_to(self.root)) if path.is_relative_to(self.root) else str(path)
-        disc_id = hashlib.sha1(rel.encode()).hexdigest()[:12]
+        disc_id = hashlib.sha1(str(path.resolve()).encode()).hexdigest()[:12]
+        if disc_id in found:  # overlapping library folders
+            return
         size = _dir_size(str(path)) if is_dir else st.st_size
         key = (str(path), st.st_mtime, size)
         info = self._info_cache.get(key)
@@ -115,18 +143,23 @@ class Library:
             info = self._info_cache[key] = read_disc_info(str(path))
         title = pretty_title(path.name if is_dir else path.stem)
         cover = _find_cover(path, path) if is_dir else _find_cover(path.with_suffix(""))
-        disc = Disc(disc_id, str(path), title, size, st.st_mtime, info, cover)
+        disc = Disc(disc_id, str(path), title, size, st.st_mtime, info, cover, folder=str(folder))
         disc.meta = self._load_meta(disc)
         found[disc_id] = disc
 
+    def discs(self) -> list[Disc]:
+        with self._lock:
+            return sorted(self._discs.values(), key=lambda d: d.title.lower())
+
     def get(self, disc_id: str) -> Disc | None:
         with self._lock:
-            disc = self._discs.get(disc_id)
-        if disc is None:  # maybe added since the last scan
-            self.scan()
-            with self._lock:
-                disc = self._discs.get(disc_id)
-        return disc
+            return self._discs.get(disc_id)
+
+    def folder_counts(self) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        for disc in self.discs():
+            counts[disc.folder] = counts.get(disc.folder, 0) + 1
+        return counts
 
     # ---- thumbnails -------------------------------------------------------------
 

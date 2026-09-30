@@ -1,5 +1,8 @@
 """HTTP + WebSocket front end: the library API, thumbnails, and one DvdSession per player socket.
 
+Everything except the page itself, its static files and the sign-in API needs a
+signed-in user (web_auth.py); admin tools are in admin.py.
+
 WebSocket protocol (/api/discs/<id>/play):
   server -> client  {"type": "hello", "disc", "transports": ["webrtc", "mse"]}
   client -> server  {"type": "start", "transport": "webrtc"|"mse", "video_codecs": [...]}
@@ -23,11 +26,15 @@ from pathlib import Path
 
 from aiohttp import WSCloseCode, WSMsgType, web
 
-from . import webrtc
+from . import admin, web_auth, webrtc
+from .accounts import Accounts
+from .appkeys import ACCOUNTS, CRF, DB, LIBRARY, SOCKETS, WEBRTC
+from .db import Database
 from .fmp4 import Fmp4Output
 from .library import Library
 from .player import DvdSession
 from .udpmux import UdpMux
+from .web_auth import client_ip, require_user
 
 log = logging.getLogger(__name__)
 
@@ -41,12 +48,6 @@ class WebRtcConfig:
     mux: UdpMux | None = None  # the one UDP port visitors from the internet connect to
 
 
-LIBRARY = web.AppKey("library", Library)
-CRF = web.AppKey("crf", int)
-WEBRTC = web.AppKey("webrtc", object)  # WebRtcConfig, or None when WebRTC is unavailable
-SOCKETS = web.AppKey("sockets", weakref.WeakSet)
-
-
 async def index(_request: web.Request) -> web.Response:
     # Stamp asset URLs with their modification time so browsers never run a stale app.js.
     version = str(int(max(f.stat().st_mtime for f in WEB_DIR.iterdir())))
@@ -54,31 +55,33 @@ async def index(_request: web.Request) -> web.Response:
     return web.Response(text=html, content_type="text/html", headers={"Cache-Control": "no-cache"})
 
 
+@require_user
 async def list_discs(request: web.Request) -> web.Response:
     library = request.app[LIBRARY]
-    discs = await asyncio.get_running_loop().run_in_executor(None, library.scan)
-    return web.json_response({"discs": [library.to_json(d) for d in discs]})
+    return web.json_response({"discs": [library.to_json(d) for d in library.discs()], "scanning": library.scanning})
 
 
+@require_user
 async def thumbnail(request: web.Request) -> web.StreamResponse:
     library = request.app[LIBRARY]
     disc = library.get(request.match_info["disc_id"])
     path = disc and library.thumbnail_path(disc)
     if not path:
         raise web.HTTPNotFound()
-    return web.FileResponse(path, headers={"Cache-Control": "public, max-age=86400"})
+    return web.FileResponse(path, headers={"Cache-Control": "private, max-age=86400"})
 
 
+@require_user
 async def play(request: web.Request) -> web.StreamResponse:
     library = request.app[LIBRARY]
     disc = library.get(request.match_info["disc_id"])
     if disc is None:
         raise web.HTTPNotFound()
 
-    # Behind a reverse proxy the peer is the proxy; it passes the viewer's address along.
-    viewer = request.headers.get("X-Real-IP") or request.remote
+    viewer = f"{request['user'].username} ({client_ip(request)})"
     ws = web.WebSocketResponse(heartbeat=20, max_msg_size=1 << 16)
     await ws.prepare(request)
+    ws["user_id"] = request["user"].id  # so an admin deleting the account can stop playback
     request.app[SOCKETS].add(ws)
     loop = asyncio.get_running_loop()
     outbox: asyncio.Queue[tuple[str, object]] = asyncio.Queue()
@@ -195,12 +198,17 @@ async def _close_sockets(app: web.Application) -> None:
         await ws.close(code=WSCloseCode.GOING_AWAY, message=b"server shutting down")
 
 
-def create_app(library: Library, crf: int = 20, rtc: WebRtcConfig | None = None) -> web.Application:
-    app = web.Application()
+def create_app(db: Database, accounts: Accounts, library: Library, crf: int = 20,
+               rtc: WebRtcConfig | None = None) -> web.Application:
+    app = web.Application(middlewares=[web_auth.auth_middleware])
+    app[DB] = db
+    app[ACCOUNTS] = accounts
     app[LIBRARY] = library
     app[CRF] = crf
     app[WEBRTC] = rtc
     app[SOCKETS] = weakref.WeakSet()
+    web_auth.add_routes(app)
+    admin.add_routes(app)
     app.on_startup.append(_start_mux)
     app.on_shutdown.append(_close_sockets)
     app.on_cleanup.append(_stop_mux)

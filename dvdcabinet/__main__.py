@@ -7,6 +7,7 @@ variables, a .env file next to run.sh, and the defaults below.
 from __future__ import annotations
 
 import argparse
+import time
 import logging
 import os
 import socket
@@ -56,6 +57,17 @@ def _udp_port_free(port: int) -> bool:
             return False
 
 
+def _seed_library(db, folder: Path) -> None:
+    """On first start, add the configured library folder so there's something to watch."""
+    if db.get_setting("library_seeded"):
+        return
+    db.set_setting("library_seeded", "1")
+    if folder.is_dir():
+        db.execute("INSERT OR IGNORE INTO library_folders (path, added_at) VALUES (?, ?)",
+                   (str(folder.resolve()), int(time.time())))
+        logging.info("added library folder %s", folder.resolve())
+
+
 def main() -> None:
     settings = {**load_env_file(ROOT / ".env"), **os.environ}
 
@@ -70,10 +82,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         prog="dvdcabinet", description="Stream DVD images, menus and all, to a browser.",
         epilog="Every option can also be set in .env or the environment as DVD_<NAME>, e.g. DVD_PORT=8080.")
+    parser.add_argument("--data-dir", type=Path, default=path_setting("DATA_DIR", ROOT / "data"),
+                        help="where the server keeps its database and thumbnails (DVD_DATA_DIR)")
     parser.add_argument("--library", type=Path, default=path_setting("LIBRARY", ROOT / "DVDs"),
-                        help="folder with .iso files / VIDEO_TS folders (DVD_LIBRARY)")
-    parser.add_argument("--cache", type=Path, default=path_setting("CACHE", ROOT / ".cache"),
-                        help="where thumbnails are kept (DVD_CACHE)")
+                        help="library folder to start with on first run; after that, manage folders "
+                             "on the admin page (DVD_LIBRARY)")
     parser.add_argument("--host", default=setting("HOST", "0.0.0.0"),
                         help="address to listen on, default all interfaces (DVD_HOST)")
     parser.add_argument("--port", type=int, default=int(setting("PORT", 8080)), help="web port (DVD_PORT)")
@@ -107,12 +120,12 @@ def main() -> None:
     from aiohttp import web
 
     from . import webrtc
+    from .accounts import Accounts
+    from .db import Database
     from .library import Library
     from .server import WebRtcConfig, create_app
     from .udpmux import UdpMux
 
-    if not args.library.is_dir():
-        parser.error(f"library folder {args.library} does not exist")
     lan = _lan_address()
     rtc = None
     if not args.no_webrtc:
@@ -130,16 +143,23 @@ def main() -> None:
                 logging.info("WebRTC from outside: browsers connect to %s:%d/udp (forward it to %s:%d)",
                              args.public_ip, args.rtc_port, lan, args.rtc_port)
             rtc = WebRtcConfig(args.webrtc_codec, mux)
-    library = Library(args.library, args.cache)
-    discs = library.scan()
-    logging.info("library %s: %d disc(s)", args.library.resolve(), len(discs))
+    db = Database(args.data_dir / "dvdcabinet.db")
+    accounts = Accounts(db)
+    accounts.prune_sessions()
+    _seed_library(db, args.library)
+    library = Library(args.data_dir / "cache")
+    library.set_folders([r["path"] for r in db.all("SELECT path FROM library_folders ORDER BY path")])
+    library.scan_in_background()
 
     urls = [f"http://localhost:{args.port}/"]
     if args.host in ("0.0.0.0", "::") and lan:
         urls.append(f"http://{lan}:{args.port}/")
     print("\n  DVD Cabinet is running:  " + "   ".join(urls) + "\n", flush=True)
-    web.run_app(create_app(library, args.crf, rtc), host=args.host, port=args.port, print=None, shutdown_timeout=5,
-                access_log=logging.getLogger("aiohttp.access") if args.verbose else None)
+    if accounts.needs_setup():
+        print("  Open it to claim this server and create the admin account. From outside your\n"
+              f"  local network you'll also need this setup code:  {accounts.setup_code}\n", flush=True)
+    web.run_app(create_app(db, accounts, library, args.crf, rtc), host=args.host, port=args.port, print=None,
+                shutdown_timeout=5, access_log=logging.getLogger("aiohttp.access") if args.verbose else None)
 
 
 if __name__ == "__main__":

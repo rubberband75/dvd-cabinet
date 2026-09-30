@@ -9,15 +9,32 @@
   <link rel="stylesheet" href="/static/style.css?v=__VERSION__">
 </head>
 <body>
+  <!-- shared by every logo; a gradient inside a hidden section wouldn't render -->
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true" focusable="false">
+    <linearGradient id="disc-sheen" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ffe0a3"/><stop offset=".45" stop-color="#f5b53d"/><stop offset="1" stop-color="#b8740c"/>
+    </linearGradient>
+  </svg>
+  <!-- Sign in / claim the server --------------------------------------------->
+  <section id="auth" class="auth hidden">
+    <form id="auth-form" class="auth-card" autocomplete="on" novalidate>
+      <svg class="logo" viewBox="0 0 48 48" aria-hidden="true"><circle cx="24" cy="24" r="22" fill="url(#disc-sheen)"/><circle cx="24" cy="24" r="16" fill="none" stroke="#fff" stroke-opacity=".28"/><circle cx="24" cy="24" r="11" fill="none" stroke="#fff" stroke-opacity=".18"/><circle cx="24" cy="24" r="7" fill="#0b0d12"/></svg>
+      <h1 id="auth-title">Sign in</h1>
+      <p id="auth-text" class="muted"></p>
+      <label>Username <input id="auth-user" name="username" autocomplete="username" autocapitalize="off" spellcheck="false" required></label>
+      <label>Password <input id="auth-pass" name="password" type="password" autocomplete="current-password" required></label>
+      <label id="auth-confirm-row" class="hidden">Confirm password <input id="auth-confirm" type="password" autocomplete="new-password"></label>
+      <label id="auth-code-row" class="hidden">Setup code <input id="auth-code" autocomplete="off" autocapitalize="characters" spellcheck="false" placeholder="XXXX-XXXX-XXXX">
+        <span class="hint">You're not on the server's local network, so enter the code shown in the server's log.</span></label>
+      <p id="auth-error" class="form-error" role="alert"></p>
+      <button id="auth-submit" class="pill-btn accent wide" type="submit">Sign in</button>
+    </form>
+  </section>
+
   <!-- Library ---------------------------------------------------------------->
   <section id="library" class="library hidden">
     <header class="lib-header">
       <svg class="logo" viewBox="0 0 48 48" aria-hidden="true">
-        <defs>
-          <linearGradient id="disc-sheen" x1="0" y1="0" x2="1" y2="1">
-            <stop offset="0" stop-color="#ffe0a3"/><stop offset=".45" stop-color="#f5b53d"/><stop offset="1" stop-color="#b8740c"/>
-          </linearGradient>
-        </defs>
         <circle cx="24" cy="24" r="22" fill="url(#disc-sheen)"/>
         <circle cx="24" cy="24" r="16" fill="none" stroke="#fff" stroke-opacity=".28"/>
         <circle cx="24" cy="24" r="11" fill="none" stroke="#fff" stroke-opacity=".18"/>
@@ -28,13 +45,85 @@
         <p class="tagline">Your discs, menus and all.</p>
       </div>
       <span id="lib-count" class="lib-count"></span>
+      <div class="user-menu">
+        <button id="btn-user" class="user-btn" aria-haspopup="menu" aria-expanded="false"><span id="user-avatar" class="avatar"></span><span id="user-name"></span></button>
+        <div id="user-pop" class="menu-pop hidden" role="menu">
+          <a id="menu-admin" href="#/admin" role="menuitem">Server settings</a>
+          <button id="menu-password" role="menuitem">Change password</button>
+          <button id="menu-logout" role="menuitem">Sign out</button>
+        </div>
+      </div>
     </header>
     <main id="grid" class="grid" aria-live="polite"></main>
     <div id="lib-empty" class="lib-empty hidden">
       <h2>No discs yet</h2>
-      <p>Drop <code>.iso</code> images (or ripped <code>VIDEO_TS</code> folders) into your library folder and they'll show up here.</p>
+      <p id="lib-empty-text">Once an admin adds a library folder with <code>.iso</code> images (or ripped <code>VIDEO_TS</code> folders), they'll show up here.</p>
+      <a id="lib-empty-admin" class="pill-btn accent hidden" href="#/admin">Add a library folder</a>
     </div>
   </section>
+
+  <!-- Server settings (admins) ----------------------------------------------->
+  <section id="admin" class="admin hidden">
+    <header class="admin-header">
+      <a class="icon-btn" href="#/" title="Back to library" aria-label="Back to library" data-icon="back"></a>
+      <h1>Server settings</h1>
+    </header>
+    <nav class="tabs" role="tablist">
+      <a href="#/admin" id="tab-library" role="tab">Library</a>
+      <a href="#/admin/users" id="tab-users" role="tab">Users</a>
+    </nav>
+
+    <div id="panel-library" class="panel">
+      <section class="card">
+        <h2>Library folders</h2>
+        <p class="muted">Folders on this server to look in for <code>.iso</code> images and ripped <code>VIDEO_TS</code> folders, including their subfolders.</p>
+        <ul id="folder-list" class="rows"></ul>
+        <form id="folder-form" class="inline-form">
+          <input id="folder-path" placeholder="/mnt/Media/DVDs" autocomplete="off" spellcheck="false" aria-label="Folder path">
+          <button type="button" id="btn-browse" class="pill-btn">Browse…</button>
+          <button type="submit" class="pill-btn accent">Add folder</button>
+        </form>
+        <p id="folder-error" class="form-error" role="alert"></p>
+      </section>
+      <section class="card">
+        <h2>Scan</h2>
+        <p id="scan-status" class="muted"></p>
+        <button id="btn-scan" class="pill-btn accent">Scan for new discs</button>
+      </section>
+    </div>
+
+    <div id="panel-users" class="panel hidden">
+      <section class="card">
+        <h2>Users</h2>
+        <p class="muted">Only these people can sign in. Admins can also change these settings.</p>
+        <ul id="user-list" class="rows"></ul>
+      </section>
+      <section class="card">
+        <h2>Add a user</h2>
+        <form id="user-form" class="stack-form" autocomplete="off">
+          <label>Username <input id="new-user" autocapitalize="off" spellcheck="false" required></label>
+          <label>Password <input id="new-pass" type="password" autocomplete="new-password" required>
+            <span class="hint">At least 8 characters. Give it to them; they can change it after signing in.</span></label>
+          <label class="check"><input id="new-admin" type="checkbox"> Admin</label>
+          <p id="user-error" class="form-error" role="alert"></p>
+          <button class="pill-btn accent" type="submit">Add user</button>
+        </form>
+      </section>
+    </div>
+  </section>
+
+  <!-- One dialog, filled in for each use (passwords, folder browser, confirmations) -->
+  <dialog id="dlg" class="dlg">
+    <form id="dlg-form" method="dialog">
+      <h2 id="dlg-title"></h2>
+      <div id="dlg-body"></div>
+      <p id="dlg-error" class="form-error" role="alert"></p>
+      <div class="message-actions">
+        <button id="dlg-cancel" class="pill-btn" value="cancel" formnovalidate>Cancel</button>
+        <button id="dlg-ok" class="pill-btn accent" value="ok">OK</button>
+      </div>
+    </form>
+  </dialog>
 
   <!-- Player ----------------------------------------------------------------->
   <section id="player" class="player hidden">
