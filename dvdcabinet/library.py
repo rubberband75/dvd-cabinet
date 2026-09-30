@@ -14,7 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .discinfo import DiscInfo, read_disc_info
-from .gstutil import Gst, GstVideo, navigation_command, struct_uint64_array
+from .gstutil import Gst, GstVideo, navigation_command, navigation_key, struct_uint64_array
 
 log = logging.getLogger(__name__)
 
@@ -228,6 +228,15 @@ class Library:
         }
 
 
+def _mostly_black(sample: Gst.Sample | None) -> bool:
+    if sample is None:
+        return True
+    buf = sample.get_buffer()
+    data = buf.extract_dup(0, buf.get_size())
+    step = max(1, len(data) // 20000)
+    return sum(data[::step]) / len(data[::step]) < 12  # mean brightness out of 255
+
+
 def capture_menu_thumbnail(device: str, out_path: Path, max_wait: float = 30.0) -> dict:
     """Play the disc for a few seconds and snapshot its first menu screen.
 
@@ -258,13 +267,19 @@ def capture_menu_thumbnail(device: str, out_path: Path, max_wait: float = 30.0) 
                        on_dvd_event=on_event, on_message=on_message)
     pipe.set_state(Gst.State.PLAYING)
     started = time.monotonic()
-    pressed_menu = False
+    pressed_menu = pressed_enter = False
     try:
         while not errors:
             time.sleep(0.2)
             now = time.monotonic()
             if menu_at[0] is not None and now - menu_at[0] > 2.5:
-                break
+                if pressed_enter or not _mostly_black(latest[0]):
+                    break
+                # Some discs open on a black screen with a hidden button (audio only);
+                # Enter moves on to the real menu, which makes a far better thumbnail.
+                pipe.send_upstream(navigation_key("Return"))
+                pressed_enter = True
+                menu_at[0] = now
             if not pressed_menu and menu_at[0] is None and now - started > 12:
                 pipe.send_upstream(navigation_command(GstVideo.NavigationCommand.MENU3))  # root menu
                 pressed_menu = True

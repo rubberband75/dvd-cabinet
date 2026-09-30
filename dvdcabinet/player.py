@@ -161,6 +161,17 @@ class DvdPipeline:
         if on_audio is not None:
             self._handlers.connect(audio_chain[-1], "new-sample", self._pull, self._on_audio)
         self._handlers.connect(self.dvd, "pad-added", self._on_pad_added)
+        self._handlers.connect(self.pipeline, "deep-element-added", self._on_element_added)
+
+        # Some menus have no video at all, only subpicture graphics (see _fill_missing_video).
+        self._video_queue: Gst.Element | None = None  # between rsndvdbin's video pad and dvdspu
+        self._real_video = False  # has the disc sent a frame since the last jump?
+        self._video_wait_since = time.monotonic()
+        self._filled = False  # black frame given to dvdspu since the last jump
+        self._black: dict[str, Gst.Buffer] = {}
+        self._stop = threading.Event()
+        self._filler = threading.Thread(target=self._fill_missing_video, name="video-filler", daemon=True)
+        self._filler.start()
 
         self._bus = self.pipeline.get_bus()
         self._bus.add_watch(GLib.PRIORITY_DEFAULT, self._on_bus)
@@ -180,7 +191,9 @@ class DvdPipeline:
         pad.link(queue.get_static_pad("sink"))
         if name.startswith("video"):
             queue.link_pads("src", self.spu, "video")
+            self._video_queue = queue
             self._handlers.probe(pad, Gst.PadProbeType.EVENT_DOWNSTREAM, self._on_video_pad_event)
+            self._handlers.probe(pad, Gst.PadProbeType.BUFFER, self._on_real_video)
         elif name.startswith("subpicture"):
             queue.link_pads("src", self.spu, "subpicture")
         elif name.startswith("audio"):
@@ -188,9 +201,98 @@ class DvdPipeline:
         else:
             log.warning("ignoring unexpected rsndvdbin pad %s", name)
 
+    def _on_element_added(self, _bin: Gst.Bin, _sub_bin: Gst.Bin, element: Gst.Element) -> None:
+        if element.get_name() == "rsnvidparse":  # rsndvdbin's MPEG video parser
+            self._handlers.probe(element.get_static_pad("src"), Gst.PadProbeType.BUFFER, self._fix_repeat_duration)
+
+    @staticmethod
+    def _fix_repeat_duration(pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
+        """Cap frame durations at 1.5 frames, as DVD players do.
+
+        A "repeat first field" flag means one extra field on DVD-Video. Some discs are
+        authored with the MPEG-2 progressive_sequence flag set, which makes the parser
+        read it as "show this frame 2-3 times"; the decoder's timeline then runs far
+        ahead of the real timestamps and it drops frames (choppy playback).
+        """
+        caps = pad.get_current_caps()
+        if caps is None:
+            return Gst.PadProbeReturn.OK
+        ok, fps_n, fps_d = caps.get_structure(0).get_fraction("framerate")
+        buf = info.get_buffer()
+        if ok and fps_n and buf.duration != Gst.CLOCK_TIME_NONE:
+            longest = 3 * Gst.SECOND * fps_d // (2 * fps_n)
+            if buf.duration > longest + Gst.MSECOND:
+                buf.duration = longest  # the buffer is ours alone here; edit it in place
+        return Gst.PadProbeReturn.OK
+
+    def _on_real_video(self, _pad: Gst.Pad, _info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
+        self._real_video = True
+        return Gst.PadProbeReturn.OK
+
+    def _fill_missing_video(self) -> None:
+        """Give dvdspu a black frame when the disc plays a stretch with no video.
+
+        Some menus are only audio plus subpicture graphics (the buttons). dvdspu can only
+        draw onto video frames, and until the video sink has a frame the pipeline won't
+        even start, so the whole disc would hang. Players show such menus on black. One
+        black frame is enough: dvdspu keeps re-drawing its last frame as the subpicture
+        stream advances, highlights included. Still menus aren't affected: they send a
+        real frame first.
+        """
+        while not self._stop.wait(0.1):
+            if (self._real_video or self._filled or self._video_queue is None
+                    or time.monotonic() - self._video_wait_since < 0.5):
+                continue
+            # Feed the queue in front of dvdspu (never blocks us; it keeps frames in order
+            # with the disc's own events) rather than dvdspu directly.
+            pad = self._video_queue.get_static_pad("sink")
+            caps = pad.get_current_caps()
+            if caps is None:
+                continue
+            segment_event = pad.get_sticky_event(Gst.EventType.SEGMENT, 0)
+            if segment_event is None:
+                # The video decoder only passes the segment on with its first frame, which
+                # never comes; the audio/subpicture streams share the same DVD timeline.
+                segment_event = self._borrowed_segment()
+                if segment_event is None:
+                    continue
+                pad.send_event(segment_event)
+            segment = segment_event.parse_segment()
+            pts = -1
+            clock = self.pipeline.get_clock()
+            if clock is not None and self.pipeline.get_state(0)[1] == Gst.State.PLAYING:
+                running = clock.get_time() - self.pipeline.get_base_time()
+                pts = segment.position_from_running_time(Gst.Format.TIME, running)
+            if pts in (-1, Gst.CLOCK_TIME_NONE) or pts < segment.start:
+                pts = segment.start
+            frame = self._black_frame(caps).copy()
+            frame.pts = pts
+            self._filled = True
+            pad.chain(frame)
+
+    def _borrowed_segment(self) -> Gst.Event | None:
+        for name in ("audio", "subpicture"):
+            pad = self.dvd.get_static_pad(name)
+            event = pad.get_sticky_event(Gst.EventType.SEGMENT, 0) if pad else None
+            if event is not None:
+                return event
+        return None
+
+    def _black_frame(self, caps: Gst.Caps) -> Gst.Buffer:
+        s = caps.get_structure(0)
+        key = f"{s.get_string('format')}:{s.get_int('width')[1]}x{s.get_int('height')[1]}"
+        if key not in self._black:
+            self._black[key] = black_frame(
+                f"video/x-raw,format={s.get_string('format')},width={s.get_int('width')[1]},height={s.get_int('height')[1]}")
+        return self._black[key]
+
     def _on_video_pad_event(self, _pad: Gst.Pad, info: Gst.PadProbeInfo) -> Gst.PadProbeReturn:
         event = info.get_event()
-        if event.type == Gst.EventType.CAPS:
+        if event.type == Gst.EventType.FLUSH_STOP:  # a jump: wait for this stretch's video again
+            self._real_video = False
+            self._video_wait_since = time.monotonic()
+            self._filled = False
+        elif event.type == Gst.EventType.CAPS:
             s = event.parse_caps().get_structure(0)
             ok_w, w = s.get_int("width")
             ok_h, h = s.get_int("height")
@@ -231,7 +333,9 @@ class DvdPipeline:
         return self.pipeline.set_state(state)
 
     def close(self) -> None:
-        self.pipeline.set_state(Gst.State.NULL)
+        self._stop.set()
+        self.pipeline.set_state(Gst.State.NULL)  # also unblocks a filler frame waiting in preroll
+        self._filler.join(timeout=2)
         self._bus.remove_watch()
         self._handlers.release()
 
@@ -255,7 +359,7 @@ class MediaPacer:
         self.delay_ns = delay_ms * 1_000_000
         self.audio_target = AUDIO_RATE * delay_ms // 1000  # samples to keep queued
         self._frames: deque[tuple[int, Gst.Buffer]] = deque()
-        self._frame = _black_frame(geometry)
+        self._frame = black_frame(geometry.video_caps)  # shown until the disc produces a picture
         self._audio = bytearray()
         self._audio_buffering = True
         self._lock = threading.Lock()
@@ -351,12 +455,9 @@ class MediaPacer:
                 samples += AUDIO_SLICE
 
 
-def _black_frame(geometry: StreamGeometry) -> Gst.Buffer:
-    """A correctly laid-out black I420 frame, shown until the disc produces a picture."""
-    pipe = Gst.parse_launch(
-        f"videotestsrc pattern=black num-buffers=1 ! {geometry.video_caps},framerate={geometry.fps_n}/{geometry.fps_d} "
-        "! appsink name=sink sync=false"
-    )
+def black_frame(caps: str) -> Gst.Buffer:
+    """A correctly laid-out black frame in the given raw video format."""
+    pipe = Gst.parse_launch(f"videotestsrc pattern=black num-buffers=1 ! {caps} ! appsink name=sink sync=false")
     pipe.set_state(Gst.State.PLAYING)
     sample = pipe.get_by_name("sink").emit("try-pull-sample", 5 * Gst.SECOND)
     pipe.set_state(Gst.State.NULL)
